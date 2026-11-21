@@ -42,9 +42,9 @@ _connector = None
 _voucher_sem = None
 _start_time = time.monotonic()
 
-SESSION_POOL_LIMIT = 60
-SESSION_POOL_SLOTS = 5
-CONCURRENCY = 500
+SESSION_POOL_LIMIT = 100
+SESSION_POOL_SLOTS = 25
+CONCURRENCY = 1200
 BATCH_SIZE = 5000
 
 # =====================================================================
