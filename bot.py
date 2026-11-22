@@ -7,9 +7,19 @@ import ddddocr
 import numpy as np
 from datetime import datetime, timedelta, timezone
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "9270543827:AAHIktdv-ULZQq_HspVNkjX91E3JgbdbchM").strip()
-# Railway Variables ထဲမှာ token အဟောင်းကျန်နေခဲ့ရင် ကျော်ပြီး ဒီ token ကိုပဲ တိုက်ရိုက်သုံးမည်
-GITHUB_TOKEN = "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".strip()
+BOT_TOKEN = re.sub(r"\s+", "", os.environ.get("BOT_TOKEN", "9270543827:AAHIktdv-ULZQq_HspVNkjX91E3JgbdbchM"))
+
+# Railway Variables ထဲမှာ GITHUB_TOKEN မထည့်ထားရင် (သို့မဟုတ် empty ဖြစ်နေရင်) အောက်ပါ token ကို သုံးမည်
+RAW_GITHUB_TOKEN = "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"
+
+def _resolve_github_token():
+    env_tok = re.sub(r"\s+", "", os.environ.get("GITHUB_TOKEN", ""))
+    if env_tok:
+        return env_tok, "env:GITHUB_TOKEN"
+    code_tok = re.sub(r"\s+", "", RAW_GITHUB_TOKEN or "")
+    return code_tok, "code:RAW_GITHUB_TOKEN"
+
+GITHUB_TOKEN, GITHUB_TOKEN_SOURCE = _resolve_github_token()
 REPO_OWNER = "kothethuser2-collab"
 REPO_NAME = "bot-data"
 ADMIN_ID = "6130147402"
@@ -59,12 +69,21 @@ SESSION_POOL_SLOTS = 25
 CONCURRENCY = 1200
 BATCH_SIZE = 5000
 
+def _token_debug_info(tok: str) -> str:
+    clean = re.sub(r"\s+", "", tok or "")
+    if not clean:
+        return "EMPTY"
+    if len(clean) <= 10:
+        return f"len={len(clean)}:{clean[:2]}..{clean[-2:]}"
+    return f"len={len(clean)}:{clean[:6]}...{clean[-4:]}"
+
 def _github_headers(extra=None):
-    tok = (GITHUB_TOKEN or "").strip()
+    tok = re.sub(r"\s+", "", GITHUB_TOKEN or "")
     prefix = "Bearer" if tok.startswith("github_pat_") else "token"
     h = {
         "Authorization": f"{prefix} {tok}",
         "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
     }
     if extra:
         h.update(extra)
@@ -106,6 +125,8 @@ async def purge_unauthorized_access():
     async with redeem_lock:
         codes, _ = await get_file_content("redeem_codes.json")
         valid_codes = set(codes.keys()) if isinstance(codes, dict) else set()
+        if not valid_codes:
+            return
         bad_uids = []
         for uid, acc in redeem_access.items():
             k = str((acc or {}).get("code", "")).upper()
@@ -229,7 +250,7 @@ async def web_server():
     port = int(os.environ.get('PORT', 8099))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    print(f"Web server started on port {port}")
+    print(f"Web server started on port {port} | github_token={_token_debug_info(GITHUB_TOKEN)} ({GITHUB_TOKEN_SOURCE})")
 
 async def rebuild_session():
     global session, _connector
@@ -275,8 +296,7 @@ async def get_file_content(path):
                     return dict(_codes_cache), _codes_cache_sha
                 return {}, None
             body = await response.text()
-            tok_preview = f"{GITHUB_TOKEN[:6]}...{GITHUB_TOKEN[-4:]}" if len(GITHUB_TOKEN) > 10 else "EMPTY"
-            print(f"[github] GET {path} failed: {response.status} (token={tok_preview}) {body[:200]}")
+            print(f"[github] GET {path} failed: {response.status} src={GITHUB_TOKEN_SOURCE} tok={_token_debug_info(GITHUB_TOKEN)} {body[:200]}")
     except Exception as e:
         print(f"[github] GET {path} exception: {e}")
 
@@ -348,8 +368,7 @@ async def update_file_content(path, content, sha, message):
                         return True, retry_text
                     print(f"[github] PUT retry {path} failed: {retry_resp.status} {retry_text[:200]}")
                     return False, retry_text
-            tok_preview = f"{GITHUB_TOKEN[:6]}...{GITHUB_TOKEN[-4:]}" if len(GITHUB_TOKEN) > 10 else "EMPTY"
-            print(f"[github] PUT {path} failed: {response.status} (token={tok_preview}) {text[:200]}")
+            print(f"[github] PUT {path} failed: {response.status} src={GITHUB_TOKEN_SOURCE} tok={_token_debug_info(GITHUB_TOKEN)} {text[:200]}")
             return False, text
     except Exception as e:
         print(f"[github] PUT {path} exception: {e}")
@@ -1050,7 +1069,11 @@ async def process_genredeem_args(message, arg_text):
         _codes_cache.update(new_entries)
         ok, err_text = await update_file_content("redeem_codes.json", codes, sha, f"Generate {count} redeem code(s)")
     if not ok:
-        await bot.reply_to(message, f"⚠️ Key ထုတ်ပြီးသော်လည်း GitHub သို့ သိမ်းဆည်းရာတွင် အခက်အခဲရှိခဲ့သည် —\n`{err_text[:180]}`", parse_mode="Markdown")
+        await bot.reply_to(
+            message,
+            f"⚠️ Key ထုတ်ပြီးသော်လည်း GitHub သို့ သိမ်းဆည်းရာတွင် အခက်အခဲရှိခဲ့သည် —\n`{err_text[:180]}`\n• Token src: `{GITHUB_TOKEN_SOURCE}` (`{_token_debug_info(GITHUB_TOKEN)}`)",
+            parse_mode="Markdown"
+        )
         return
     await bot.reply_to(
         message,
@@ -1254,7 +1277,9 @@ async def send_bot_status(chat_id, ref_message=None):
         f"⚡ Concurrency: {CONCURRENCY}\n"
         f"🔍 Active Scans: {active_scans}\n"
         f"✅ Approved Users: {approved_users}\n"
-        f"👥 Sessions Loaded: {len(user_data)}"
+        f"👥 Sessions Loaded: {len(user_data)}\n"
+        f"🔐 Token Src: `{GITHUB_TOKEN_SOURCE}` (`{_token_debug_info(GITHUB_TOKEN)}`)",
+        parse_mode="Markdown"
     )
 
 @bot.message_handler(commands=['status'])
@@ -2005,11 +2030,14 @@ async def start_polling():
         except Exception as e:
             err_str = str(e)
             if "409" in err_str or "Conflict" in err_str:
-                print(f"[polling] 409 Conflict detected (another instance running). Retrying in {backoff}s...")
+                wait_s = max(backoff, 15)
+                print(f"[polling] 409 Conflict detected (another instance running). Retrying in {wait_s}s...")
+                await asyncio.sleep(wait_s)
+                backoff = min(wait_s * 2, 60)
             else:
                 print(f"[polling] Unexpected error: {e}. Reconnecting in {backoff}s...")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
 
 async def main():
     await rebuild_session()
