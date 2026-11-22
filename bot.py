@@ -231,13 +231,24 @@ async def rebuild_session():
     )
 
 async def get_file_content(path):
-    url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/{path}"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+    url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/{path}?t={int(time.time())}"
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Cache-Control": "no-cache"
+    }
     async with session.get(url, headers=headers) as response:
         if response.status == 200:
             data = await response.json()
             content = base64.b64decode(data['content']).decode('utf-8')
-            return json.loads(content), data['sha']
+            parsed = json.loads(content)
+            if isinstance(parsed, dict):
+                normalized = {}
+                for k, v in parsed.items():
+                    nk = str(k).strip().upper()
+                    if nk:
+                        normalized[nk] = v
+                return normalized, data['sha']
+            return {}, data['sha']
         if response.status == 404:
             return {}, None
         body = await response.text()
@@ -250,15 +261,45 @@ async def update_file_content(path, content, sha, message):
         "Authorization": f"token {GITHUB_TOKEN}",
         "Content-Type": "application/json"
     }
-    encoded = base64.b64encode(json.dumps(content).encode()).decode()
+    normalized_content = {}
+    if isinstance(content, dict):
+        for k, v in content.items():
+            nk = str(k).strip().upper()
+            if nk:
+                normalized_content[nk] = v
+
+    current_sha = sha
+    if not current_sha:
+        _, latest_sha = await get_file_content(path)
+        current_sha = latest_sha
+
+    encoded = base64.b64encode(json.dumps(normalized_content, indent=2).encode('utf-8')).decode('utf-8')
     payload = {
         "message": message,
         "content": encoded,
     }
-    if sha:
-        payload["sha"] = sha
+    if current_sha:
+        payload["sha"] = current_sha
+
     async with session.put(url, headers=headers, json=payload) as response:
         text = await response.text()
+        if response.status == 409:
+            latest_data, latest_sha = await get_file_content(path)
+            if isinstance(latest_data, dict):
+                merged = dict(latest_data)
+                merged.update(normalized_content)
+                encoded_retry = base64.b64encode(json.dumps(merged, indent=2).encode('utf-8')).decode('utf-8')
+                retry_payload = {
+                    "message": message,
+                    "content": encoded_retry,
+                }
+                if latest_sha:
+                    retry_payload["sha"] = latest_sha
+                async with session.put(url, headers=headers, json=retry_payload) as retry_resp:
+                    retry_text = await retry_resp.text()
+                    if retry_resp.status not in (200, 201):
+                        print(f"[github] PUT retry {path} failed: {retry_resp.status} {retry_text[:200]}")
+                    return retry_text
         if response.status not in (200, 201):
             print(f"[github] PUT {path} failed: {response.status} {text[:200]}")
         return text
@@ -793,7 +834,7 @@ async def delete_redeem_code(chat_id, raw_code):
         await safe_send_message(chat_id, "No Permission")
         return
 
-    code = (raw_code or "").strip().upper()
+    code = re.sub(r"[^A-Za-z0-9]", "", (raw_code or "")).upper()
     if not re.fullmatch(r"[A-Z0-9]{6}", code):
         await safe_send_message(chat_id, "❌ မှန်ကန်တဲ့ ၆ လုံး Key ရိုက်ထည့်ပေးပါ (ဥပမာ - IH39KM)။")
         return
@@ -867,10 +908,11 @@ async def consume_redeem_use(chat_id):
 async def process_redeem_code(message, raw_code):
     chat_id = message.chat.id
     is_admin = str(chat_id) == ADMIN_ID
-    if not re.fullmatch(r"[A-Z0-9]{6}", raw_code.upper()):
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", (raw_code or "")).upper()
+    if not re.fullmatch(r"[A-Z0-9]{6}", cleaned):
         await bot.reply_to(message, "Usage: /redeem <6-char-key>")
         return
-    code = raw_code.upper()
+    code = cleaned
     if is_weak_or_blocked_key(code):
         await bot.reply_to(message, "❌ ခန့်မှန်းလွယ်သော / ပိတ်ပင်ထားသော Key များကို လက်မခံပါ။ Admin ထုတ်ပေးထားသော Key ကိုသာ အသုံးပြုပါ။")
         return
@@ -885,7 +927,7 @@ async def process_redeem_code(message, raw_code):
             return
 
         claimed_by = entry.get("claimed_by")
-        if claimed_by and claimed_by != str_chat_id:
+        if claimed_by and str(claimed_by) != str_chat_id:
             await bot.reply_to(message, "❌ ဒီ redeem code ကို အခြား user က အသုံးပြုပြီးပါပြီ။")
             return
         remaining = int(entry.get("uses_remaining", 0))
