@@ -24,7 +24,7 @@ _telegram_edit = bot.edit_message_text
 user_data = {}
 pending_actions = {}
 redeem_access = {}
-random_codes = {}          
+random_codes = {}
 redeem_lock = asyncio.Lock()
 scan_tasks = {}
 success_messages = {}
@@ -56,18 +56,20 @@ def get_main_keyboard(is_admin=False):
     btn_input = InlineKeyboardButton("🌐 URL ထည့်ရန်", callback_data="cmd_input_help")
     btn_scan = InlineKeyboardButton("🔍 Scan စရန်", callback_data="cmd_scan_help")
     btn_stop = InlineKeyboardButton("🛑 Scan ရပ်ရန်", callback_data="cmd_stop")
-    
+
     markup.add(btn_redeem, btn_input)
     markup.add(btn_scan, btn_stop)
-    
+
     if is_admin:
         btn_gen = InlineKeyboardButton("⚙️ Key ထုတ်ရန်", callback_data="cmd_gen_help")
+        btn_del = InlineKeyboardButton("🗑️ Key ဖျက်ရန်", callback_data="cmd_del_help")
         btn_list = InlineKeyboardButton("📋 Key စာရင်း", callback_data="cmd_listredeem")
         btn_status = InlineKeyboardButton("📊 Bot Status", callback_data="cmd_status")
         btn_stats = InlineKeyboardButton("📈 ကျန်ရှိမှု / Stats", callback_data="cmd_stats")
-        markup.add(btn_gen, btn_stats)
-        markup.add(btn_list, btn_status)
-        
+        markup.add(btn_gen, btn_del)
+        markup.add(btn_stats, btn_list)
+        markup.add(btn_status)
+
     return markup
 
 def get_after_redeem_keyboard(is_admin=False):
@@ -354,7 +356,7 @@ async def callback_query(call):
             except Exception:
                 await bot.send_message(chat_id, text, reply_markup=get_main_keyboard(is_admin))
             await bot.answer_callback_query(call.id)
-            
+
         elif call.data == "cmd_redeem_help":
             pending_actions[chat_id] = {"type": "redeem"}
             await bot.answer_callback_query(call.id, "Key ရိုက်ထည့်ပေးပါ")
@@ -362,7 +364,7 @@ async def callback_query(call):
                 chat_id,
                 "🔑 အဆင့် (၁) - Key ထည့်ရန်\nKey ကို ရိုးရိုးရိုက်ပို့ပေးပါ (ဥပမာ - IH39KM)။\nပြီးလျှင် 🌐 URL ထည့်ရန် ခလုတ် ဆက်နှိပ်နိုင်ပါသည်။"
             )
-            
+
         elif call.data == "cmd_input_help":
             pending_actions[chat_id] = {"type": "input"}
             await bot.answer_callback_query(call.id, "URL ရိုက်ထည့်ပေးပါ")
@@ -370,7 +372,7 @@ async def callback_query(call):
                 chat_id,
                 "🌐 အဆင့် (၂) - Wi-Fi URL ထည့်ရန်\nSession URL ကို ရိုးရိုးရိုက်ပို့ပေးပါ။\nပြီးလျှင် 🔍 Scan စရန် ခလုတ် ဆက်နှိပ်နိုင်ပါသည်။"
             )
-            
+
         elif call.data == "cmd_scan_help":
             pending_actions.pop(chat_id, None)
             await bot.answer_callback_query(call.id, "Scan Mode ရွေးပါ")
@@ -379,7 +381,7 @@ async def callback_query(call):
                 await bot.edit_message_text(scan_prompt, chat_id, call.message.message_id, reply_markup=get_scan_keyboard())
             except Exception:
                 await bot.send_message(chat_id, scan_prompt, reply_markup=get_scan_keyboard())
-            
+
         elif call.data.startswith("scan_"):
             mode = call.data.split("_", 1)[1]
             if not await redeem_user_access(chat_id):
@@ -412,12 +414,12 @@ async def callback_query(call):
                     "• ကျပန်းအစမှ စလိုလျှင် AUTO ဟု ရိုက်ပို့ပါ"
                 )
             await bot.send_message(chat_id, hint)
-            
+
         elif call.data == "cmd_stop":
             pending_actions.pop(chat_id, None)
             await bot.answer_callback_query(call.id, "Scan ရပ်နေပါပြီ...")
             await trigger_stop_scan(chat_id, call.message)
-            
+
         elif call.data == "cmd_gen_help":
             if not is_admin:
                 await bot.answer_callback_query(call.id, "No Permission")
@@ -425,12 +427,24 @@ async def callback_query(call):
             pending_actions[chat_id] = {"type": "genredeem"}
             await bot.answer_callback_query(call.id, "Success count ရိုက်ထည့်ပေးပါ")
             await bot.send_message(chat_id, "⚙️ Success count ရိုက်ထည့်ပေးပါ (ဥပမာ - 5 သို့မဟုတ် 5 2)")
-            
+
+        elif call.data == "cmd_del_help":
+            if not is_admin:
+                await bot.answer_callback_query(call.id, "No Permission")
+                return
+            pending_actions[chat_id] = {"type": "delete_key"}
+            await bot.answer_callback_query(call.id, "ဖျက်မယ့် Key ရိုက်ပို့ပါ")
+            await bot.send_message(
+                chat_id,
+                "🗑️ ဖျက်/ပိတ်ချင်တဲ့ **Key** ကို ရိုက်ထည့်ပို့ပေးပါ —\n(ဥပမာ - `IH39KM`)",
+                parse_mode="Markdown"
+            )
+
         elif call.data == "cmd_listredeem":
             pending_actions.pop(chat_id, None)
             await bot.answer_callback_query(call.id, "စာရင်းဖတ်နေပါပြီ...")
             await send_redeem_list(chat_id, call.message)
-            
+
         elif call.data == "cmd_status":
             pending_actions.pop(chat_id, None)
             await bot.answer_callback_query(call.id, "အခြေအနေစစ်ဆေးနေပါပြီ...")
@@ -440,21 +454,90 @@ async def callback_query(call):
             pending_actions.pop(chat_id, None)
             await bot.answer_callback_query(call.id, "ကျန်ရှိမှု စစ်ဆေးနေပါပြီ...")
             await send_remaining_stats(chat_id, call.message)
-            
+
     except Exception as e:
         print(f"Callback Error: {e}")
+
+def is_blocked_key(code: str) -> bool:
+    return (code or "").upper().startswith("ABC")
 
 def generate_redeem_code(existing_codes):
     alphabet = string.ascii_uppercase + string.digits
     while True:
         code = ''.join(random.choice(alphabet) for _ in range(6))
+        if is_blocked_key(code):
+            continue
         if code not in existing_codes and code not in random_codes:
             return code
+
+async def delete_redeem_code(chat_id, raw_code):
+    if str(chat_id) != ADMIN_ID:
+        await safe_send_message(chat_id, "No Permission")
+        return
+
+    code = (raw_code or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9]{6}", code):
+        await safe_send_message(chat_id, "❌ မှန်ကန်တဲ့ ၆ လုံး Key ရိုက်ထည့်ပေးပါ (ဥပမာ - IH39KM)။")
+        return
+
+    removed_mem = False
+    revoked_users = 0
+    stopped_scans = 0
+    deleted_github = False
+
+    async with redeem_lock:
+        if code in random_codes:
+            random_codes.pop(code, None)
+            removed_mem = True
+
+        target_users = [
+            uid for uid, acc in redeem_access.items()
+            if isinstance(acc, dict) and str(acc.get("code", "")).upper() == code
+        ]
+        for uid in target_users:
+            redeem_access.pop(uid, None)
+            revoked_users += 1
+
+            task_info = scan_tasks.get(uid)
+            if task_info and task_info.get("task") and not task_info["task"].done():
+                task_info["stop"] = True
+                task_info["scan_id"] = None
+                for child_task in task_info.get("pending", set()):
+                    child_task.cancel()
+                task_info["task"].cancel()
+                stopped_scans += 1
+
+        codes, sha = await get_file_content("redeem_codes.json")
+        if isinstance(codes, dict) and code in codes:
+            codes.pop(code, None)
+            await update_file_content(
+                "redeem_codes.json",
+                codes,
+                sha,
+                f"Delete redeem code {code}"
+            )
+            deleted_github = True
+
+    if not deleted_github and not removed_mem and revoked_users == 0:
+        await safe_send_message(chat_id, f"⚠️ `{code}` ကို မတွေ့ပါ။", parse_mode="Markdown")
+        return
+
+    await safe_send_message(
+        chat_id,
+        f"🗑️ **Key `{code}` ကို ဖျက်ပြီးပါပြီ**\n"
+        f"• GitHub မှ ဖျက်ပြီး: `{'Yes' if deleted_github else 'No'}`\n"
+        f"• Active Users ဖြုတ်ပြီး: `{revoked_users}`\n"
+        f"• ရပ်လိုက်တဲ့ Scan: `{stopped_scans}`",
+        parse_mode="Markdown"
+    )
 
 async def redeem_user_access(chat_id):
     async with redeem_lock:
         access = redeem_access.get(chat_id)
         if not access or access.get("uses_remaining", 0) <= 0:
+            return False
+        if is_blocked_key(access.get("code", "")):
+            redeem_access.pop(chat_id, None)
             return False
         return True
 
@@ -462,6 +545,9 @@ async def consume_redeem_use(chat_id):
     async with redeem_lock:
         access = redeem_access.get(chat_id)
         if not access or access.get("uses_remaining", 0) <= 0:
+            return False
+        if is_blocked_key(access.get("code", "")):
+            redeem_access.pop(chat_id, None)
             return False
         return True
 
@@ -472,6 +558,9 @@ async def process_redeem_code(message, raw_code):
         await bot.reply_to(message, "Usage: /redeem ABC123")
         return
     code = raw_code.upper()
+    if is_blocked_key(code):
+        await bot.reply_to(message, "❌ `ABC` ဖြင့် စသော Key များကို အသုံးပြုခွင့် ပိတ်ထားပါသည်။", parse_mode="Markdown")
+        return
     str_chat_id = str(chat_id)
 
     if chat_id in redeem_access and redeem_access[chat_id].get("code") == code:
@@ -882,6 +971,8 @@ async def handle_pending_text(message):
         await process_input_url(message, text)
     elif action == "genredeem":
         await process_genredeem_args(message, text)
+    elif action == "delete_key":
+        await delete_redeem_code(chat_id, text)
     elif action == "scan_prefix":
         mode = state.get("mode")
         try:
@@ -1184,12 +1275,12 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
             return
 
     access = redeem_access.get(chat_id)
-    if not access or access.get("uses_remaining", 0) <= 0:
+    if not access or access.get("uses_remaining", 0) <= 0 or is_blocked_key(access.get("code", "")):
         current_task = scan_tasks.get(chat_id)
         if current_task and not current_task["task"].done():
             current_task["stop"] = True
             current_task["scan_id"] = None
-            print(f"[perform_check] no uses left, stopping scan for chat={chat_id}")
+            print(f"[perform_check] no uses left or blocked key, stopping scan for chat={chat_id}")
         return
 
     post_url = base64.b64decode(b'aHR0cHM6Ly9wb3J0YWwtYXMucnVpamllbmV0d29ya3MuY29tL2FwaS9hdXRoL3ZvdWNoZXIvP2xhbmc9ZW5fVVM=').decode()
