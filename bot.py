@@ -8,20 +8,6 @@ import numpy as np
 from datetime import datetime, timedelta, timezone
 
 BOT_TOKEN = re.sub(r"\s+", "", os.environ.get("BOT_TOKEN", "9270543827:AAHIktdv-ULZQq_HspVNkjX91E3JgbdbchM"))
-
-# Railway Variables ထဲမှာ GITHUB_TOKEN မထည့်ထားရင် (သို့မဟုတ် empty ဖြစ်နေရင်) အောက်ပါ token ကို သုံးမည်
-RAW_GITHUB_TOKEN = "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"
-
-def _resolve_github_token():
-    env_tok = re.sub(r"\s+", "", os.environ.get("GITHUB_TOKEN", ""))
-    if env_tok:
-        return env_tok, "env:GITHUB_TOKEN"
-    code_tok = re.sub(r"\s+", "", RAW_GITHUB_TOKEN or "")
-    return code_tok, "code:RAW_GITHUB_TOKEN"
-
-GITHUB_TOKEN, GITHUB_TOKEN_SOURCE = _resolve_github_token()
-REPO_OWNER = "kothethuser2-collab"
-REPO_NAME = "bot-data"
 ADMIN_ID = "6130147402"
 
 # ===== Redeem / Scan config =====
@@ -56,6 +42,8 @@ _session_pool = {}
 _github_sync_pending = {}
 _admin_notified_exhausted = set()
 
+_local_codes = {}
+_local_codes_lock = asyncio.Lock()
 _codes_cache = {}
 _codes_cache_sha = None
 
@@ -69,25 +57,20 @@ SESSION_POOL_SLOTS = 25
 CONCURRENCY = 1200
 BATCH_SIZE = 5000
 
-def _token_debug_info(tok: str) -> str:
-    clean = re.sub(r"\s+", "", tok or "")
-    if not clean:
-        return "EMPTY"
-    if len(clean) <= 10:
-        return f"len={len(clean)}:{clean[:2]}..{clean[-2:]}"
-    return f"len={len(clean)}:{clean[:6]}...{clean[-4:]}"
+def _normalize_code_str(raw_code):
+    return re.sub(r"[^A-Za-z0-9]", "", str(raw_code or "")).upper()
 
-def _github_headers(extra=None):
-    tok = re.sub(r"\s+", "", GITHUB_TOKEN or "")
-    prefix = "Bearer" if tok.startswith("github_pat_") else "token"
-    h = {
-        "Authorization": f"{prefix} {tok}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    if extra:
-        h.update(extra)
-    return h
+def _normalize_codes_dict(raw):
+    out = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            nk = _normalize_code_str(k)
+            if nk and isinstance(v, dict):
+                entry = dict(v)
+                entry["uses_total"] = max(1, int(entry.get("uses_total", RANDOM_CODE_DEFAULT_USES)))
+                entry["uses_remaining"] = max(0, int(entry.get("uses_remaining", entry["uses_total"])))
+                out[nk] = entry
+    return out
 
 def format_duration(seconds_val):
     sec = max(0, int(seconds_val))
@@ -100,7 +83,7 @@ def format_duration(seconds_val):
     return f"{s}s"
 
 def is_weak_or_blocked_key(code: str) -> bool:
-    c = (code or "").strip().upper()
+    c = _normalize_code_str(code)
     if not c:
         return True
     if c.startswith("ABC"):
@@ -129,7 +112,7 @@ async def purge_unauthorized_access():
             return
         bad_uids = []
         for uid, acc in redeem_access.items():
-            k = str((acc or {}).get("code", "")).upper()
+            k = _normalize_code_str((acc or {}).get("code", ""))
             if k not in valid_codes or is_weak_or_blocked_key(k):
                 bad_uids.append(uid)
         for uid in bad_uids:
@@ -237,7 +220,7 @@ def get_stopped_keyboard():
     return markup
 
 # =====================================================================
-# WEB SERVER & SESSIONS
+# WEB SERVER, SESSIONS & LOCAL KEY STORAGE
 # =====================================================================
 async def handle(request):
     return web.Response(text="Bot is awake and running 24/7!")
@@ -250,7 +233,7 @@ async def web_server():
     port = int(os.environ.get('PORT', 8099))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    print(f"Web server started on port {port} | github_token={_token_debug_info(GITHUB_TOKEN)} ({GITHUB_TOKEN_SOURCE})")
+    print(f"Web server started on port {port} | key_storage=local-memory")
 
 async def rebuild_session():
     global session, _connector
@@ -267,112 +250,17 @@ async def rebuild_session():
     )
 
 async def get_file_content(path):
-    global _codes_cache, _codes_cache_sha
-    url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/{path}?t={int(time.time())}"
-    headers = _github_headers({"Cache-Control": "no-cache"})
-    try:
-        async with session.get(url, headers=headers) as response:
-            if response.status == 200:
-                data = await response.json()
-                content = base64.b64decode(data['content']).decode('utf-8')
-                parsed = json.loads(content)
-                normalized = {}
-                if isinstance(parsed, dict):
-                    for k, v in parsed.items():
-                        nk = str(k).strip().upper()
-                        if nk and isinstance(v, dict):
-                            normalized[nk] = v
-                if path == "redeem_codes.json":
-                    merged = dict(normalized)
-                    for ck, cv in _codes_cache.items():
-                        if ck not in merged:
-                            merged[ck] = cv
-                    _codes_cache = merged
-                    _codes_cache_sha = data.get('sha')
-                    return dict(_codes_cache), _codes_cache_sha
-                return normalized, data.get('sha')
-            if response.status == 404:
-                if path == "redeem_codes.json":
-                    return dict(_codes_cache), _codes_cache_sha
-                return {}, None
-            body = await response.text()
-            print(f"[github] GET {path} failed: {response.status} src={GITHUB_TOKEN_SOURCE} tok={_token_debug_info(GITHUB_TOKEN)} {body[:200]}")
-    except Exception as e:
-        print(f"[github] GET {path} exception: {e}")
-
-    if path == "redeem_codes.json" and _codes_cache:
-        return dict(_codes_cache), _codes_cache_sha
-    return {}, None
+    async with _local_codes_lock:
+        return dict(_local_codes), None
 
 async def update_file_content(path, content, sha, message):
-    global _codes_cache, _codes_cache_sha
-    url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/{path}"
-    headers = _github_headers({"Content-Type": "application/json"})
-    normalized_content = {}
-    if isinstance(content, dict):
-        for k, v in content.items():
-            nk = str(k).strip().upper()
-            if nk:
-                normalized_content[nk] = v
-
-    current_sha = sha or (_codes_cache_sha if path == "redeem_codes.json" else None)
-    if not current_sha:
-        _, latest_sha = await get_file_content(path)
-        current_sha = latest_sha
-
-    encoded = base64.b64encode(json.dumps(normalized_content, indent=2).encode('utf-8')).decode('utf-8')
-    payload = {
-        "message": message,
-        "content": encoded,
-    }
-    if current_sha:
-        payload["sha"] = current_sha
-
-    try:
-        async with session.put(url, headers=headers, json=payload) as response:
-            text = await response.text()
-            if response.status in (200, 201):
-                try:
-                    resp_json = json.loads(text)
-                    new_sha = resp_json.get("content", {}).get("sha")
-                except Exception:
-                    new_sha = None
-                if path == "redeem_codes.json":
-                    _codes_cache = dict(normalized_content)
-                    if new_sha:
-                        _codes_cache_sha = new_sha
-                return True, text
-            if response.status == 409:
-                latest_data, latest_sha = await get_file_content(path)
-                merged = dict(latest_data) if isinstance(latest_data, dict) else {}
-                merged.update(normalized_content)
-                encoded_retry = base64.b64encode(json.dumps(merged, indent=2).encode('utf-8')).decode('utf-8')
-                retry_payload = {
-                    "message": message,
-                    "content": encoded_retry,
-                }
-                if latest_sha:
-                    retry_payload["sha"] = latest_sha
-                async with session.put(url, headers=headers, json=retry_payload) as retry_resp:
-                    retry_text = await retry_resp.text()
-                    if retry_resp.status in (200, 201):
-                        try:
-                            r_json = json.loads(retry_text)
-                            new_sha = r_json.get("content", {}).get("sha")
-                        except Exception:
-                            new_sha = None
-                        if path == "redeem_codes.json":
-                            _codes_cache = dict(merged)
-                            if new_sha:
-                                _codes_cache_sha = new_sha
-                        return True, retry_text
-                    print(f"[github] PUT retry {path} failed: {retry_resp.status} {retry_text[:200]}")
-                    return False, retry_text
-            print(f"[github] PUT {path} failed: {response.status} src={GITHUB_TOKEN_SOURCE} tok={_token_debug_info(GITHUB_TOKEN)} {text[:200]}")
-            return False, text
-    except Exception as e:
-        print(f"[github] PUT {path} exception: {e}")
-        return False, str(e)
+    async with _local_codes_lock:
+        normalized = _normalize_codes_dict(content)
+        _local_codes.clear()
+        _local_codes.update(normalized)
+        _codes_cache.clear()
+        _codes_cache.update(normalized)
+        return True, "OK (local memory)"
 
 async def notify_admin_found(chat_id, key_code, mode, found_code, expire_info):
     if str(chat_id) == ADMIN_ID:
@@ -419,20 +307,16 @@ async def _sync_redeem_to_github(chat_id):
                 access = redeem_access.get(chat_id)
                 if not access:
                     return
-                codes, sha = await get_file_content("redeem_codes.json")
-                if not sha and not _codes_cache:
-                    return
-                user_code = access["code"]
+                codes, _ = await get_file_content("redeem_codes.json")
+                user_code = _normalize_code_str(access.get("code", ""))
                 if user_code in codes:
                     codes[user_code]["uses_remaining"] = access["uses_remaining"]
-                    _codes_cache[user_code] = codes[user_code]
                     await update_file_content(
-                        "redeem_codes.json", codes, sha,
+                        "redeem_codes.json", codes, None,
                         f"Sync uses_remaining for {chat_id}"
                     )
-                    print(f"[github-sync] chat={chat_id} uses_remaining={access['uses_remaining']}")
         except Exception as e:
-            print(f"[github-sync] error: {e}")
+            print(f"[local-sync] error: {e}")
         finally:
             _github_sync_pending.pop(chat_id, None)
     _github_sync_pending[chat_id] = asyncio.create_task(_do_sync())
@@ -443,18 +327,14 @@ async def _final_sync_to_github(chat_id):
         if not access:
             return
         try:
-            codes, sha = await get_file_content("redeem_codes.json")
-            if not sha and not _codes_cache:
-                return
-            user_code = access["code"]
+            codes, _ = await get_file_content("redeem_codes.json")
+            user_code = _normalize_code_str(access.get("code", ""))
             if user_code in codes:
                 codes[user_code]["uses_remaining"] = access["uses_remaining"]
-                _codes_cache[user_code] = codes[user_code]
                 await update_file_content(
-                    "redeem_codes.json", codes, sha,
+                    "redeem_codes.json", codes, None,
                     f"Final sync uses_remaining for {chat_id}"
                 )
-                print(f"[final-sync] chat={chat_id} uses_remaining={access['uses_remaining']}")
         except Exception as e:
             print(f"[final-sync] error: {e}")
 
@@ -568,38 +448,39 @@ async def add_key_uses(chat_id, raw_input):
     if len(parts) != 2 or not parts[1].isdigit() or int(parts[1]) < 1:
         await safe_send_message(chat_id, "❌ ပုံစံမှန် ရိုက်ထည့်ပါ — ဥပမာ: `IH39KM 5`", parse_mode="Markdown")
         return
-    code = parts[0].upper()
+    code = _normalize_code_str(parts[0])
     add_amount = int(parts[1])
     if not re.fullmatch(r"[A-Z0-9]{6}", code):
         await safe_send_message(chat_id, "❌ ၆ လုံး Key မှန်ကန်စွာ ရိုက်ထည့်ပါ။")
         return
 
-    updated_github = False
+    found_key = False
     new_rem = 0
     new_tot = 0
 
     async with redeem_lock:
-        codes, sha = await get_file_content("redeem_codes.json")
+        codes, _ = await get_file_content("redeem_codes.json")
         if isinstance(codes, dict) and code in codes:
-            entry = codes[code]
+            entry = dict(codes[code])
             entry["uses_remaining"] = int(entry.get("uses_remaining", 0)) + add_amount
             entry["uses_total"] = max(int(entry.get("uses_total", entry["uses_remaining"])), entry["uses_remaining"])
-            _codes_cache[code] = entry
+            codes[code] = entry
             new_rem = entry["uses_remaining"]
             new_tot = entry["uses_total"]
-            ok, _ = await update_file_content("redeem_codes.json", codes, sha, f"Add {add_amount} uses to {code}")
-            updated_github = ok
+            found_key = True
+            await update_file_content("redeem_codes.json", codes, None, f"Add {add_amount} uses to {code}")
 
         for uid, acc in redeem_access.items():
-            if str(acc.get("code", "")).upper() == code:
+            if _normalize_code_str(acc.get("code", "")) == code:
                 acc["uses_remaining"] = int(acc.get("uses_remaining", 0)) + add_amount
                 acc["uses_total"] = max(int(acc.get("uses_total", acc["uses_remaining"])), acc["uses_remaining"])
-                if not updated_github:
+                if not found_key:
                     new_rem = acc["uses_remaining"]
                     new_tot = acc["uses_total"]
+                    found_key = True
 
-    if not updated_github:
-        await safe_send_message(chat_id, f"⚠️ `{code}` ကို `redeem_codes.json` ထဲတွင် မတွေ့ပါ။", parse_mode="Markdown")
+    if not found_key:
+        await safe_send_message(chat_id, f"⚠️ `{code}` ကို မတွေ့ပါ။", parse_mode="Markdown")
         return
 
     await safe_send_message(
@@ -612,7 +493,7 @@ async def reset_key_usage(chat_id, raw_code):
     if str(chat_id) != ADMIN_ID:
         await safe_send_message(chat_id, "No Permission")
         return
-    code = (raw_code or "").strip().upper()
+    code = _normalize_code_str(raw_code)
     if not re.fullmatch(r"[A-Z0-9]{6}", code):
         await safe_send_message(chat_id, "❌ မှန်ကန်တဲ့ ၆ လုံး Key ရိုက်ထည့်ပေးပါ (ဥပမာ - IH39KM)။")
         return
@@ -621,27 +502,27 @@ async def reset_key_usage(chat_id, raw_code):
     reset_tot = RANDOM_CODE_DEFAULT_USES
 
     async with redeem_lock:
-        codes, sha = await get_file_content("redeem_codes.json")
+        codes, _ = await get_file_content("redeem_codes.json")
         if isinstance(codes, dict) and code in codes:
-            entry = codes[code]
+            entry = dict(codes[code])
             tot = max(1, int(entry.get("uses_total", RANDOM_CODE_DEFAULT_USES)))
             entry["uses_remaining"] = tot
             entry["claimed_by"] = None
             entry["claimed_at"] = None
-            _codes_cache[code] = entry
+            codes[code] = entry
             reset_tot = tot
-            ok, _ = await update_file_content("redeem_codes.json", codes, sha, f"Reset key {code}")
-            found_any = ok
+            found_any = True
+            await update_file_content("redeem_codes.json", codes, None, f"Reset key {code}")
 
         users_to_drop = [
             uid for uid, acc in redeem_access.items()
-            if str(acc.get("code", "")).upper() == code
+            if _normalize_code_str(acc.get("code", "")) == code
         ]
         for uid in users_to_drop:
             redeem_access.pop(uid, None)
 
     if not found_any:
-        await safe_send_message(chat_id, f"⚠️ `{code}` ကို `redeem_codes.json` ထဲတွင် မတွေ့ပါ။", parse_mode="Markdown")
+        await safe_send_message(chat_id, f"⚠️ `{code}` ကို မတွေ့ပါ။", parse_mode="Markdown")
         return
 
     await safe_send_message(
@@ -656,9 +537,9 @@ async def clean_exhausted_keys(chat_id):
         return
 
     async with redeem_lock:
-        codes, sha = await get_file_content("redeem_codes.json")
+        codes, _ = await get_file_content("redeem_codes.json")
         if not isinstance(codes, dict) or not codes:
-            await safe_send_message(chat_id, "GitHub ထဲတွင် Key မရှိပါ။")
+            await safe_send_message(chat_id, "Key မရှိသေးပါ။")
             return
 
         exhausted = [k for k, v in codes.items() if int(v.get("uses_remaining", 0)) <= 0]
@@ -668,12 +549,11 @@ async def clean_exhausted_keys(chat_id):
 
         for k in exhausted:
             codes.pop(k, None)
-            _codes_cache.pop(k, None)
 
         await update_file_content(
             "redeem_codes.json",
             codes,
-            sha,
+            None,
             f"Clean {len(exhausted)} exhausted key(s)"
         )
 
@@ -729,7 +609,7 @@ async def callback_query(call):
             await bot.answer_callback_query(call.id, "Key ရိုက်ထည့်ပေးပါ")
             await bot.send_message(
                 chat_id,
-                "🔑 အဆင့် (၁) - Key ထည့်ရန်\nAdmin ထုတ်ပေးထားသော ၆ လုံး Key ကို ရိုးရိုးရိုက်ပို့ပေးပါ။\nပြီးလျှင် 🌐 URL ထည့်ရန် ခလုတ် ဆက်နှိပ်နိုင်ပါသည်။"
+                "🔑 အဆင့် (၁) - Key ထည့်ရန်\nထုတ်ပေးထားသော ၆ လုံး Key ကို ရိုးရိုးရိုက်ပို့ပေးပါ။\nပြီးလျှင် 🌐 URL ထည့်ရန် ခလုတ် ဆက်နှိပ်နိုင်ပါသည်။"
             )
 
         elif call.data == "cmd_input_help":
@@ -793,7 +673,7 @@ async def callback_query(call):
                 return
             pending_actions[chat_id] = {"type": "genredeem"}
             await bot.answer_callback_query(call.id, "Success count ရိုက်ထည့်ပေးပါ")
-            await bot.send_message(chat_id, "⚙️ Success count ရိုက်ထည့်ပေးပါ (ဥပမာ - 5 သို့မဟုတ် 5 2)")
+            await bot.send_message(chat_id, "⚙️ ကျပန်း Key ထုတ်ရန် Success count ရိုက်ထည့်ပေးပါ (ဥပမာ - 5 သို့မဟုတ် 5 3)")
 
         elif call.data == "cmd_del_help":
             if not is_admin:
@@ -909,19 +789,19 @@ async def delete_redeem_code(chat_id, raw_code):
         await safe_send_message(chat_id, "No Permission")
         return
 
-    code = re.sub(r"[^A-Za-z0-9]", "", (raw_code or "")).upper()
+    code = _normalize_code_str(raw_code)
     if not re.fullmatch(r"[A-Z0-9]{6}", code):
         await safe_send_message(chat_id, "❌ မှန်ကန်တဲ့ ၆ လုံး Key ရိုက်ထည့်ပေးပါ (ဥပမာ - IH39KM)။")
         return
 
     revoked_users = 0
     stopped_scans = 0
-    deleted_github = False
+    deleted_any = False
 
     async with redeem_lock:
         target_users = [
             uid for uid, acc in redeem_access.items()
-            if isinstance(acc, dict) and str(acc.get("code", "")).upper() == code
+            if isinstance(acc, dict) and _normalize_code_str(acc.get("code", "")) == code
         ]
         for uid in target_users:
             redeem_access.pop(uid, None)
@@ -936,26 +816,20 @@ async def delete_redeem_code(chat_id, raw_code):
                 task_info["task"].cancel()
                 stopped_scans += 1
 
-        _codes_cache.pop(code, None)
-        codes, sha = await get_file_content("redeem_codes.json")
+        codes, _ = await get_file_content("redeem_codes.json")
         if isinstance(codes, dict) and code in codes:
             codes.pop(code, None)
-            ok, _ = await update_file_content(
-                "redeem_codes.json",
-                codes,
-                sha,
-                f"Delete redeem code {code}"
-            )
-            deleted_github = ok
+            deleted_any = True
+            await update_file_content("redeem_codes.json", codes, None, f"Delete redeem code {code}")
 
-    if not deleted_github and revoked_users == 0:
+    if not deleted_any and revoked_users == 0:
         await safe_send_message(chat_id, f"⚠️ `{code}` ကို မတွေ့ပါ။", parse_mode="Markdown")
         return
 
     await safe_send_message(
         chat_id,
         f"🗑️ **Key `{code}` ကို ဖျက်ပြီးပါပြီ**\n"
-        f"• GitHub မှ ဖျက်ပြီး: `{'Yes' if deleted_github else 'No'}`\n"
+        f"• စာရင်းမှ ဖျက်ပြီး: `{'Yes' if deleted_any else 'No'}`\n"
         f"• Active Users ဖြုတ်ပြီး: `{revoked_users}`\n"
         f"• ရပ်လိုက်တဲ့ Scan: `{stopped_scans}`",
         parse_mode="Markdown"
@@ -984,26 +858,22 @@ async def consume_redeem_use(chat_id):
 async def process_redeem_code(message, raw_code):
     chat_id = message.chat.id
     is_admin = str(chat_id) == ADMIN_ID
-    cleaned = re.sub(r"[^A-Za-z0-9]", "", (raw_code or "")).upper()
+    cleaned = _normalize_code_str(raw_code)
     if not re.fullmatch(r"[A-Z0-9]{6}", cleaned):
         await bot.reply_to(message, "Usage: /redeem <6-char-key>")
         return
     code = cleaned
     if is_weak_or_blocked_key(code):
-        await bot.reply_to(message, "❌ ခန့်မှန်းလွယ်သော / ပိတ်ပင်ထားသော Key များကို လက်မခံပါ။ Admin ထုတ်ပေးထားသော Key ကိုသာ အသုံးပြုပါ။")
+        await bot.reply_to(message, "❌ ခန့်မှန်းလွယ်သော / ပိတ်ပင်ထားသော Key များကို လက်မခံပါ။ ကျပန်းထုတ်ထားသော Key ကိုသာ အသုံးပြုပါ။")
         return
     str_chat_id = str(chat_id)
 
     async with redeem_lock:
-        codes, sha = await get_file_content("redeem_codes.json")
+        codes, _ = await get_file_content("redeem_codes.json")
         entry = codes.get(code) if isinstance(codes, dict) else None
-        if not entry and code in _codes_cache:
-            entry = _codes_cache[code]
-            if isinstance(codes, dict):
-                codes[code] = entry
 
         if not entry or not isinstance(entry, dict):
-            await bot.reply_to(message, "❌ မှန်ကန်သော Key မဟုတ်ပါ (သို့မဟုတ် Admin ထုတ်ပေးထားသော Key မဟုတ်ပါ)။")
+            await bot.reply_to(message, "❌ မှန်ကန်သော Key မဟုတ်ပါ (သို့မဟုတ် Bot မှ ထုတ်ပေးထားသော Key မဟုတ်ပါ)။")
             return
 
         claimed_by = entry.get("claimed_by")
@@ -1018,10 +888,8 @@ async def process_redeem_code(message, raw_code):
         entry["claimed_by"] = str_chat_id
         if not entry.get("claimed_at"):
             entry["claimed_at"] = datetime.now(timezone.utc).isoformat()
-        _codes_cache[code] = entry
-        if isinstance(codes, dict):
-            codes[code] = entry
-            await update_file_content("redeem_codes.json", codes, sha, f"Redeem code {code} by {str_chat_id}")
+        codes[code] = entry
+        await update_file_content("redeem_codes.json", codes, None, f"Redeem code {code} by {str_chat_id}")
 
         redeem_access[chat_id] = {
             "code": code,
@@ -1048,36 +916,27 @@ async def process_genredeem_args(message, arg_text):
     if count < 1 or count > 100:
         await bot.reply_to(message, "count သည် 1 မှ 100 အတွင်း ဖြစ်ရပါမည်။")
         return
+
     async with redeem_lock:
-        codes, sha = await get_file_content("redeem_codes.json")
+        codes, _ = await get_file_content("redeem_codes.json")
         if not isinstance(codes, dict):
             codes = {}
         generated = []
-        new_entries = {}
         for _ in range(count):
             code = generate_redeem_code(codes)
-            entry_obj = {
+            codes[code] = {
                 "uses_total": uses,
                 "uses_remaining": uses,
                 "claimed_by": None,
                 "claimed_at": None,
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
-            codes[code] = entry_obj
-            new_entries[code] = entry_obj
             generated.append(f"`{code}`")
-        _codes_cache.update(new_entries)
-        ok, err_text = await update_file_content("redeem_codes.json", codes, sha, f"Generate {count} redeem code(s)")
-    if not ok:
-        await bot.reply_to(
-            message,
-            f"⚠️ Key ထုတ်ပြီးသော်လည်း GitHub သို့ သိမ်းဆည်းရာတွင် အခက်အခဲရှိခဲ့သည် —\n`{err_text[:180]}`\n• Token src: `{GITHUB_TOKEN_SOURCE}` (`{_token_debug_info(GITHUB_TOKEN)}`)",
-            parse_mode="Markdown"
-        )
-        return
+        await update_file_content("redeem_codes.json", codes, None, f"Generate {count} redeem code(s)")
+
     await bot.reply_to(
         message,
-        f"Generated {count} redeem code(s) with {uses} uses each (နှိပ်ပြီး copy ကူးနိုင်သည်):\n" + "\n".join(generated),
+        f"✅ ကျပန်း Key `{count}` ခု ထုတ်ပြီးပါပြီ (တစ်ခုချင်းစီ `{uses}` uses):\n" + "\n".join(generated),
         parse_mode="Markdown"
     )
 
@@ -1278,8 +1137,7 @@ async def send_bot_status(chat_id, ref_message=None):
         f"🔍 Active Scans: {active_scans}\n"
         f"✅ Approved Users: {approved_users}\n"
         f"👥 Sessions Loaded: {len(user_data)}\n"
-        f"🔐 Token Src: `{GITHUB_TOKEN_SOURCE}` (`{_token_debug_info(GITHUB_TOKEN)}`)",
-        parse_mode="Markdown"
+        f"🔑 Keys in Memory: {len(_local_codes)}"
     )
 
 @bot.message_handler(commands=['status'])
@@ -1325,7 +1183,7 @@ async def send_remaining_stats(chat_id, ref_message=None):
 
     codes, _ = await get_file_content("redeem_codes.json")
     if codes:
-        lines.append("\n🗂 GitHub Key များ ကျန်ရှိမှု")
+        lines.append("\n🗂 Key များ ကျန်ရှိမှု")
         for c, entry in codes.items():
             lines.append(f"• {c}: {entry.get('uses_remaining', 0)}/{entry.get('uses_total', 0)} | user: {entry.get('claimed_by') or '-'}")
 
