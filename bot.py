@@ -7,8 +7,9 @@ import ddddocr
 import numpy as np
 from datetime import datetime, timedelta, timezone
 
-BOT_TOKEN = "9270543827:AAHIktdv-ULZQq_HspVNkjX91E3JgbdbchM"
-GITHUB_TOKEN = "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"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "9270543827:AAHIktdv-ULZQq_HspVNkjX91E3JgbdbchM").strip()
+# Railway Variables ထဲမှာ token အဟောင်းကျန်နေခဲ့ရင် ကျော်ပြီး ဒီ token ကိုပဲ တိုက်ရိုက်သုံးမည်
+GITHUB_TOKEN = "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".strip()
 REPO_OWNER = "kothethuser2-collab"
 REPO_NAME = "bot-data"
 ADMIN_ID = "6130147402"
@@ -57,6 +58,17 @@ SESSION_POOL_LIMIT = 100
 SESSION_POOL_SLOTS = 25
 CONCURRENCY = 1200
 BATCH_SIZE = 5000
+
+def _github_headers(extra=None):
+    tok = (GITHUB_TOKEN or "").strip()
+    prefix = "Bearer" if tok.startswith("github_pat_") else "token"
+    h = {
+        "Authorization": f"{prefix} {tok}",
+        "Accept": "application/vnd.github+json",
+    }
+    if extra:
+        h.update(extra)
+    return h
 
 def format_duration(seconds_val):
     sec = max(0, int(seconds_val))
@@ -236,10 +248,7 @@ async def rebuild_session():
 async def get_file_content(path):
     global _codes_cache, _codes_cache_sha
     url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/{path}?t={int(time.time())}"
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Cache-Control": "no-cache"
-    }
+    headers = _github_headers({"Cache-Control": "no-cache"})
     try:
         async with session.get(url, headers=headers) as response:
             if response.status == 200:
@@ -266,7 +275,8 @@ async def get_file_content(path):
                     return dict(_codes_cache), _codes_cache_sha
                 return {}, None
             body = await response.text()
-            print(f"[github] GET {path} failed: {response.status} {body[:200]}")
+            tok_preview = f"{GITHUB_TOKEN[:6]}...{GITHUB_TOKEN[-4:]}" if len(GITHUB_TOKEN) > 10 else "EMPTY"
+            print(f"[github] GET {path} failed: {response.status} (token={tok_preview}) {body[:200]}")
     except Exception as e:
         print(f"[github] GET {path} exception: {e}")
 
@@ -277,10 +287,7 @@ async def get_file_content(path):
 async def update_file_content(path, content, sha, message):
     global _codes_cache, _codes_cache_sha
     url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/{path}"
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Content-Type": "application/json"
-    }
+    headers = _github_headers({"Content-Type": "application/json"})
     normalized_content = {}
     if isinstance(content, dict):
         for k, v in content.items():
@@ -341,7 +348,8 @@ async def update_file_content(path, content, sha, message):
                         return True, retry_text
                     print(f"[github] PUT retry {path} failed: {retry_resp.status} {retry_text[:200]}")
                     return False, retry_text
-            print(f"[github] PUT {path} failed: {response.status} {text[:200]}")
+            tok_preview = f"{GITHUB_TOKEN[:6]}...{GITHUB_TOKEN[-4:]}" if len(GITHUB_TOKEN) > 10 else "EMPTY"
+            print(f"[github] PUT {path} failed: {response.status} (token={tok_preview}) {text[:200]}")
             return False, text
     except Exception as e:
         print(f"[github] PUT {path} exception: {e}")
@@ -1995,7 +2003,11 @@ async def start_polling():
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
         except Exception as e:
-            print(f"[polling] Unexpected error: {e}. Reconnecting in {backoff}s...")
+            err_str = str(e)
+            if "409" in err_str or "Conflict" in err_str:
+                print(f"[polling] 409 Conflict detected (another instance running). Retrying in {backoff}s...")
+            else:
+                print(f"[polling] Unexpected error: {e}. Reconnecting in {backoff}s...")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
