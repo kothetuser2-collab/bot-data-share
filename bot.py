@@ -16,6 +16,7 @@ ADMIN_ID = "6130147402"
 # ===== Redeem / Scan config =====
 RANDOM_CODE_DEFAULT_USES = 5
 GITHUB_SYNC_DEBOUNCE = 5
+STALLED_SCAN_SECONDS = 90
 
 bot = AsyncTeleBot(BOT_TOKEN)
 _telegram_send = bot.send_message
@@ -47,6 +48,16 @@ SESSION_POOL_SLOTS = 25
 CONCURRENCY = 1200
 BATCH_SIZE = 5000
 
+def format_duration(seconds_val):
+    sec = max(0, int(seconds_val))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h}h {m}m {s}s"
+    if m > 0:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
 # =====================================================================
 # MENU KEYBOARDS
 # =====================================================================
@@ -56,20 +67,38 @@ def get_main_keyboard(is_admin=False):
     btn_input = InlineKeyboardButton("🌐 URL ထည့်ရန်", callback_data="cmd_input_help")
     btn_scan = InlineKeyboardButton("🔍 Scan စရန်", callback_data="cmd_scan_help")
     btn_stop = InlineKeyboardButton("🛑 Scan ရပ်ရန်", callback_data="cmd_stop")
+    btn_my_status = InlineKeyboardButton("👤 ကျွန်ုပ်အခြေအနေ", callback_data="cmd_my_status")
 
     markup.add(btn_redeem, btn_input)
     markup.add(btn_scan, btn_stop)
+    markup.add(btn_my_status)
 
     if is_admin:
         btn_gen = InlineKeyboardButton("⚙️ Key ထုတ်ရန်", callback_data="cmd_gen_help")
         btn_del = InlineKeyboardButton("🗑️ Key ဖျက်ရန်", callback_data="cmd_del_help")
+        btn_add_uses = InlineKeyboardButton("➕ Uses ထပ်ပေါင်း", callback_data="cmd_add_uses_help")
+        btn_reset_key = InlineKeyboardButton("🔄 Key Reset", callback_data="cmd_reset_key_help")
+        btn_clean_exp = InlineKeyboardButton("🧹 ကုန်ပြီး Key ရှင်း", callback_data="cmd_clean_exhausted")
+        btn_speed = InlineKeyboardButton("⚡ Speed Preset", callback_data="cmd_speed_menu")
         btn_list = InlineKeyboardButton("📋 Key စာရင်း", callback_data="cmd_listredeem")
-        btn_status = InlineKeyboardButton("📊 Bot Status", callback_data="cmd_status")
         btn_stats = InlineKeyboardButton("📈 ကျန်ရှိမှု / Stats", callback_data="cmd_stats")
+        btn_status = InlineKeyboardButton("📊 Bot Status", callback_data="cmd_status")
         markup.add(btn_gen, btn_del)
+        markup.add(btn_add_uses, btn_reset_key)
+        markup.add(btn_clean_exp, btn_speed)
         markup.add(btn_stats, btn_list)
         markup.add(btn_status)
 
+    return markup
+
+def get_speed_keyboard():
+    markup = InlineKeyboardMarkup(row_width=3)
+    markup.add(
+        InlineKeyboardButton("🐢 Low (600)", callback_data="set_speed_600"),
+        InlineKeyboardButton("⚖️ Balanced (1200)", callback_data="set_speed_1200"),
+        InlineKeyboardButton("🚀 High (1800)", callback_data="set_speed_1800")
+    )
+    markup.add(InlineKeyboardButton("🔙 နောက်သို့", callback_data="cmd_start"))
     return markup
 
 def get_after_redeem_keyboard(is_admin=False):
@@ -78,15 +107,19 @@ def get_after_redeem_keyboard(is_admin=False):
         InlineKeyboardButton("🌐 URL ထည့်ရန်", callback_data="cmd_input_help"),
         InlineKeyboardButton("🔍 Scan စရန်", callback_data="cmd_scan_help")
     )
-    markup.add(InlineKeyboardButton("🏠 Main Menu", callback_data="cmd_start"))
+    markup.add(
+        InlineKeyboardButton("👤 ကျွန်ုပ်အခြေအနေ", callback_data="cmd_my_status"),
+        InlineKeyboardButton("🏠 Main Menu", callback_data="cmd_start")
+    )
     return markup
 
 def get_after_input_keyboard():
     markup = InlineKeyboardMarkup(row_width=2)
     markup.add(
         InlineKeyboardButton("🔍 Scan စရန်", callback_data="cmd_scan_help"),
-        InlineKeyboardButton("🏠 Main Menu", callback_data="cmd_start")
+        InlineKeyboardButton("👤 ကျွန်ုပ်အခြေအနေ", callback_data="cmd_my_status")
     )
+    markup.add(InlineKeyboardButton("🏠 Main Menu", callback_data="cmd_start"))
     return markup
 
 def get_scan_keyboard():
@@ -181,6 +214,22 @@ async def update_file_content(path, content, sha, message):
         if response.status not in (200, 201):
             print(f"[github] PUT {path} failed: {response.status} {text[:200]}")
         return text
+
+async def notify_admin_found(chat_id, key_code, mode, found_code, expire_info):
+    if str(chat_id) == ADMIN_ID:
+        return
+    msg = (
+        f"🎉 **Success Code တွေ့ရှိပါပြီ!**\n\n"
+        f"• User ID: `{chat_id}`\n"
+        f"• Key: `{key_code}`\n"
+        f"• Mode: `{mode}`\n"
+        f"• Voucher Code: `{found_code}`\n"
+        f"• {expire_info}"
+    )
+    try:
+        await safe_send_message(int(ADMIN_ID), msg, parse_mode="Markdown")
+    except Exception as e:
+        print(f"[admin-found-notify] error: {e}")
 
 async def notify_admin_exhausted(chat_id, code, uses_total, found_count=0, checked_count=0):
     notify_key = f"{chat_id}:{code}"
@@ -326,6 +375,169 @@ bot.reply_to = safe_reply_to
 bot.edit_message_text = safe_edit_message_text
 
 # =====================================================================
+# USER STATUS & ADMIN KEY ACTIONS
+# =====================================================================
+async def send_user_status(chat_id):
+    is_admin = str(chat_id) == ADMIN_ID
+    acc = redeem_access.get(chat_id)
+    u_url = user_data.get(chat_id, {}).get("session_url")
+    scan_info = scan_tasks.get(chat_id)
+    is_scanning = bool(scan_info and not scan_info["task"].done())
+
+    if acc and acc.get("uses_remaining", 0) > 0:
+        key_line = f"🔑 Key: `{acc.get('code')}` | ကျန်ရှိ: `{acc.get('uses_remaining')}/{acc.get('uses_total')}`"
+    else:
+        key_line = "🔑 Key: မရှိသေးပါ (သို့မဟုတ် ကုန်ဆုံးပါပြီ)"
+
+    url_line = f"🌐 Session URL: `{u_url}`" if u_url else "🌐 Session URL: ထည့်မထားသေးပါ"
+    scan_line = f"🔍 Scan အခြေအနေ: {'လုပ်ဆောင်နေသည်' if is_scanning else 'ရပ်နားထားသည်'}"
+
+    await safe_send_message(
+        chat_id,
+        f"👤 **ကျွန်ုပ် အသုံးပြုမှု အခြေအနေ**\n\n{key_line}\n{url_line}\n{scan_line}",
+        parse_mode="Markdown",
+        reply_markup=get_after_redeem_keyboard(is_admin)
+    )
+
+async def add_key_uses(chat_id, raw_input):
+    if str(chat_id) != ADMIN_ID:
+        await safe_send_message(chat_id, "No Permission")
+        return
+    parts = (raw_input or "").strip().split()
+    if len(parts) != 2 or not parts[1].isdigit() or int(parts[1]) < 1:
+        await safe_send_message(chat_id, "❌ ပုံစံမှန် ရိုက်ထည့်ပါ — ဥပမာ: `IH39KM 5`", parse_mode="Markdown")
+        return
+    code = parts[0].upper()
+    add_amount = int(parts[1])
+    if not re.fullmatch(r"[A-Z0-9]{6}", code):
+        await safe_send_message(chat_id, "❌ ၆ လုံး Key မှန်ကန်စွာ ရိုက်ထည့်ပါ။")
+        return
+
+    updated_github = False
+    updated_mem = False
+    new_rem = 0
+    new_tot = 0
+
+    async with redeem_lock:
+        codes, sha = await get_file_content("redeem_codes.json")
+        if isinstance(codes, dict) and code in codes:
+            entry = codes[code]
+            entry["uses_remaining"] = int(entry.get("uses_remaining", 0)) + add_amount
+            entry["uses_total"] = max(int(entry.get("uses_total", entry["uses_remaining"])), entry["uses_remaining"])
+            new_rem = entry["uses_remaining"]
+            new_tot = entry["uses_total"]
+            await update_file_content("redeem_codes.json", codes, sha, f"Add {add_amount} uses to {code}")
+            updated_github = True
+
+        if code in random_codes:
+            r_entry = random_codes[code]
+            r_entry["uses_remaining"] = int(r_entry.get("uses_remaining", 0)) + add_amount
+            r_entry["uses_total"] = max(int(r_entry.get("uses_total", r_entry["uses_remaining"])), r_entry["uses_remaining"])
+            if not updated_github:
+                new_rem = r_entry["uses_remaining"]
+                new_tot = r_entry["uses_total"]
+            updated_mem = True
+
+        for uid, acc in redeem_access.items():
+            if str(acc.get("code", "")).upper() == code:
+                acc["uses_remaining"] = int(acc.get("uses_remaining", 0)) + add_amount
+                acc["uses_total"] = max(int(acc.get("uses_total", acc["uses_remaining"])), acc["uses_remaining"])
+                if not updated_github and not updated_mem:
+                    new_rem = acc["uses_remaining"]
+                    new_tot = acc["uses_total"]
+
+    if not updated_github and not updated_mem:
+        await safe_send_message(chat_id, f"⚠️ `{code}` ကို မတွေ့ပါ။", parse_mode="Markdown")
+        return
+
+    await safe_send_message(
+        chat_id,
+        f"✅ **Key `{code}` ထဲသို့ `+{add_amount}` ထပ်ပေါင်းပြီးပါပြီ**\n• လက်ရှိ ကျန်ရှိမှု: `{new_rem}/{new_tot}`",
+        parse_mode="Markdown"
+    )
+
+async def reset_key_usage(chat_id, raw_code):
+    if str(chat_id) != ADMIN_ID:
+        await safe_send_message(chat_id, "No Permission")
+        return
+    code = (raw_code or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9]{6}", code):
+        await safe_send_message(chat_id, "❌ မှန်ကန်တဲ့ ၆ လုံး Key ရိုက်ထည့်ပေးပါ (ဥပမာ - IH39KM)။")
+        return
+
+    found_any = False
+    reset_tot = RANDOM_CODE_DEFAULT_USES
+
+    async with redeem_lock:
+        codes, sha = await get_file_content("redeem_codes.json")
+        if isinstance(codes, dict) and code in codes:
+            entry = codes[code]
+            tot = max(1, int(entry.get("uses_total", RANDOM_CODE_DEFAULT_USES)))
+            entry["uses_remaining"] = tot
+            entry["claimed_by"] = None
+            entry["claimed_at"] = None
+            reset_tot = tot
+            await update_file_content("redeem_codes.json", codes, sha, f"Reset key {code}")
+            found_any = True
+
+        if code in random_codes:
+            tot = max(1, int(random_codes[code].get("uses_total", RANDOM_CODE_DEFAULT_USES)))
+            random_codes[code]["uses_remaining"] = tot
+            random_codes[code]["claimed_by"] = None
+            reset_tot = tot
+            found_any = True
+
+        users_to_drop = [
+            uid for uid, acc in redeem_access.items()
+            if str(acc.get("code", "")).upper() == code
+        ]
+        for uid in users_to_drop:
+            redeem_access.pop(uid, None)
+
+    if not found_any:
+        await safe_send_message(chat_id, f"⚠️ `{code}` ကို မတွေ့ပါ။", parse_mode="Markdown")
+        return
+
+    await safe_send_message(
+        chat_id,
+        f"🔄 **Key `{code}` ကို Reset လုပ်ပြီးပါပြီ**\n• ကျန်ရှိမှု အသစ်: `{reset_tot}/{reset_tot}`\n• Claimed User: `Cleared`",
+        parse_mode="Markdown"
+    )
+
+async def clean_exhausted_keys(chat_id):
+    if str(chat_id) != ADMIN_ID:
+        await safe_send_message(chat_id, "No Permission")
+        return
+
+    async with redeem_lock:
+        codes, sha = await get_file_content("redeem_codes.json")
+        if not isinstance(codes, dict) or not codes:
+            await safe_send_message(chat_id, "GitHub ထဲတွင် Key မရှိပါ။")
+            return
+
+        exhausted = [k for k, v in codes.items() if int(v.get("uses_remaining", 0)) <= 0]
+        if not exhausted:
+            await safe_send_message(chat_id, "✅ ကျန်ရှိမှု ကုန်သွားသော Key မရှိပါ။")
+            return
+
+        for k in exhausted:
+            codes.pop(k, None)
+            random_codes.pop(k, None)
+
+        await update_file_content(
+            "redeem_codes.json",
+            codes,
+            sha,
+            f"Clean {len(exhausted)} exhausted key(s)"
+        )
+
+    await safe_send_message(
+        chat_id,
+        f"🧹 **ကုန်သွားသော Key `{len(exhausted)}` ခုကို ရှင်းလင်းပြီးပါပြီ**\n" + ", ".join(f"`{k}`" for k in exhausted[:20]),
+        parse_mode="Markdown"
+    )
+
+# =====================================================================
 # COMMANDS & HANDLERS
 # =====================================================================
 @bot.message_handler(commands=['start'])
@@ -356,6 +568,11 @@ async def callback_query(call):
             except Exception:
                 await bot.send_message(chat_id, text, reply_markup=get_main_keyboard(is_admin))
             await bot.answer_callback_query(call.id)
+
+        elif call.data == "cmd_my_status":
+            pending_actions.pop(chat_id, None)
+            await bot.answer_callback_query(call.id, "အခြေအနေ ကြည့်နေပါပြီ...")
+            await send_user_status(chat_id)
 
         elif call.data == "cmd_redeem_help":
             pending_actions[chat_id] = {"type": "redeem"}
@@ -439,6 +656,76 @@ async def callback_query(call):
                 "🗑️ ဖျက်/ပိတ်ချင်တဲ့ **Key** ကို ရိုက်ထည့်ပို့ပေးပါ —\n(ဥပမာ - `IH39KM`)",
                 parse_mode="Markdown"
             )
+
+        elif call.data == "cmd_add_uses_help":
+            if not is_admin:
+                await bot.answer_callback_query(call.id, "No Permission")
+                return
+            pending_actions[chat_id] = {"type": "add_uses"}
+            await bot.answer_callback_query(call.id, "Key နှင့် ထပ်ပေါင်းမယ့်အရေအတွက် ရိုက်ပို့ပါ")
+            await bot.send_message(
+                chat_id,
+                "➕ Uses ထပ်ပေါင်းမယ့် **Key** နဲ့ **အရေအတွက်** ရိုက်ထည့်ပေးပါ —\n(ဥပမာ - `IH39KM 5`)",
+                parse_mode="Markdown"
+            )
+
+        elif call.data == "cmd_reset_key_help":
+            if not is_admin:
+                await bot.answer_callback_query(call.id, "No Permission")
+                return
+            pending_actions[chat_id] = {"type": "reset_key"}
+            await bot.answer_callback_query(call.id, "Reset လုပ်မယ့် Key ရိုက်ပို့ပါ")
+            await bot.send_message(
+                chat_id,
+                "🔄 Reset လုပ်ချင်တဲ့ **Key** ကို ရိုက်ထည့်ပို့ပေးပါ —\n(ဥပမာ - `IH39KM`)",
+                parse_mode="Markdown"
+            )
+
+        elif call.data == "cmd_clean_exhausted":
+            if not is_admin:
+                await bot.answer_callback_query(call.id, "No Permission")
+                return
+            pending_actions.pop(chat_id, None)
+            await bot.answer_callback_query(call.id, "ကုန်ပြီး Key တွေ ရှင်းနေပါပြီ...")
+            await clean_exhausted_keys(chat_id)
+
+        elif call.data == "cmd_speed_menu":
+            if not is_admin:
+                await bot.answer_callback_query(call.id, "No Permission")
+                return
+            pending_actions.pop(chat_id, None)
+            await bot.answer_callback_query(call.id, "Speed Preset ရွေးပါ")
+            await bot.send_message(
+                chat_id,
+                f"⚡ **Concurrency Preset ရွေးချယ်ပါ**\n• လက်ရှိ CONCURRENCY: `{CONCURRENCY}`",
+                parse_mode="Markdown",
+                reply_markup=get_speed_keyboard()
+            )
+
+        elif call.data.startswith("set_speed_"):
+            if not is_admin:
+                await bot.answer_callback_query(call.id, "No Permission")
+                return
+            global CONCURRENCY, _voucher_sem
+            new_conc = int(call.data.split("_")[-1])
+            CONCURRENCY = new_conc
+            _voucher_sem = asyncio.Semaphore(new_conc)
+            await bot.answer_callback_query(call.id, f"CONCURRENCY -> {new_conc}")
+            try:
+                await bot.edit_message_text(
+                    f"⚡ **CONCURRENCY ကို `{new_conc}` သို့ ပြောင်းလဲပြီးပါပြီ**",
+                    chat_id,
+                    call.message.message_id,
+                    parse_mode="Markdown",
+                    reply_markup=get_main_keyboard(True)
+                )
+            except Exception:
+                await bot.send_message(
+                    chat_id,
+                    f"⚡ **CONCURRENCY ကို `{new_conc}` သို့ ပြောင်းလဲပြီးပါပြီ**",
+                    parse_mode="Markdown",
+                    reply_markup=get_main_keyboard(True)
+                )
 
         elif call.data == "cmd_listredeem":
             pending_actions.pop(chat_id, None)
@@ -831,13 +1118,16 @@ async def start_scan_job(mode, chat_id, message, prefix=""):
         reply_markup=get_scanning_keyboard()
     )
     scan_id = str(uuid.uuid4())
+    now_mono = time.monotonic()
     task = asyncio.create_task(
         run_bruteforce(mode, chat_id, user_data[chat_id]['session_url'], scan_id, message=message, progress_msg=progress_msg, prefix=prefix)
     )
 
     scan_tasks[chat_id] = {
         "task": task, "stop": False, "scan_id": scan_id, "checked": 0, "total": None,
-        "speed": 0, "found": 0, "retries": 0, "start_time": time.monotonic(), "mode": mode, "prefix": prefix,
+        "speed": 0, "found": 0, "retries": 0, "start_time": now_mono,
+        "last_progress_time": now_mono, "stalled_alerted": False,
+        "mode": mode, "prefix": prefix,
     }
 
 @bot.message_handler(commands=['scan'])
@@ -863,13 +1153,12 @@ async def send_bot_status(chat_id, ref_message=None):
         return
     active_scans = sum(1 for data in scan_tasks.values() if not data["task"].done())
     approved_users = sum(1 for cid in redeem_access if redeem_access[cid].get("uses_remaining", 0) > 0)
-    uptime_seconds = int(time.monotonic() - _start_time)
-    hours, remainder = divmod(uptime_seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
+    uptime_seconds = time.monotonic() - _start_time
     await safe_send_message(
         chat_id,
         f"📊 Bot Status\n\n"
-        f"⏱ Uptime: {hours}h {minutes}m {seconds}s\n"
+        f"⏱ Uptime: {format_duration(uptime_seconds)}\n"
+        f"⚡ Concurrency: {CONCURRENCY}\n"
         f"🔍 Active Scans: {active_scans}\n"
         f"✅ Approved Users: {approved_users}\n"
         f"👥 Sessions Loaded: {len(user_data)}\n"
@@ -902,14 +1191,11 @@ async def send_remaining_stats(chat_id, ref_message=None):
             acc = redeem_access.get(cid, {})
             rem_uses = acc.get("uses_remaining", 0)
             tot_uses = acc.get("uses_total", 0)
-            elapsed_s = int(time.monotonic() - d.get("start_time", time.monotonic()))
-            h, rem = divmod(elapsed_s, 3600)
-            m, s = divmod(rem, 60)
-            elapsed_str = f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
+            elapsed_s = time.monotonic() - d.get("start_time", time.monotonic())
             pct_str = f" ({(checked/total)*100:.1f}%)" if total else ""
             lines.append(
                 f"• User {cid} | Mode {mode} | Start {prefix}\n"
-                f"  📦 {checked:,}{pct_str} | ⚡ {speed:,.0f}/m | ✅ Found {found} | 🔁 {retries} | ⏱ {elapsed_str}\n"
+                f"  📦 {checked:,}{pct_str} | ⚡ {speed:,.0f}/m | ✅ Found {found} | 🔁 {retries} | ⏱ {format_duration(elapsed_s)}\n"
                 f"  🎟 Key {acc.get('code', '-')} ကျန်ရှိမှု: {rem_uses}/{tot_uses}"
             )
     else:
@@ -973,6 +1259,10 @@ async def handle_pending_text(message):
         await process_genredeem_args(message, text)
     elif action == "delete_key":
         await delete_redeem_code(chat_id, text)
+    elif action == "add_uses":
+        await add_key_uses(chat_id, text)
+    elif action == "reset_key":
+        await reset_key_usage(chat_id, text)
     elif action == "scan_prefix":
         mode = state.get("mode")
         try:
@@ -1080,6 +1370,8 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id, message=None, prog
         total = None
 
     checked = 0
+    last_checked_snapshot = 0
+    last_checked_move_time = time.monotonic()
     scan_start = time.monotonic()
     if chat_id in scan_tasks:
         scan_tasks[chat_id]["total"] = total
@@ -1098,6 +1390,36 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id, message=None, prog
         async with _voucher_sem:
             return await perform_check(session_url, code, chat_id, scan_id, message=message)
 
+    async def _check_stalled():
+        nonlocal last_checked_snapshot, last_checked_move_time
+        now = time.monotonic()
+        if checked != last_checked_snapshot:
+            last_checked_snapshot = checked
+            last_checked_move_time = now
+            if chat_id in scan_tasks:
+                scan_tasks[chat_id]["stalled_alerted"] = False
+            return
+
+        task_rec = scan_tasks.get(chat_id)
+        if task_rec and not task_rec.get("stalled_alerted") and (now - last_checked_move_time) >= STALLED_SCAN_SECONDS:
+            task_rec["stalled_alerted"] = True
+            idle_sec = int(now - last_checked_move_time)
+            try:
+                await safe_send_message(
+                    chat_id,
+                    f"⚠️ **Scan ရပ်တန့်/နှေးကွေးနေပါသည်**\n• Checked မတက်သည်မှာ `{format_duration(idle_sec)}` ရှိပါပြီ။\n• Session URL expire ဖြစ်နေခြင်း သို့မဟုတ် network နှေးနေခြင်း ဖြစ်နိုင်ပါသည်။"
+                )
+            except Exception as err:
+                print(f"[stalled-user] error: {err}")
+            if str(chat_id) != ADMIN_ID:
+                try:
+                    await safe_send_message(
+                        int(ADMIN_ID),
+                        f"⚠️ **Stalled Scan Alert**\n• User ID: `{chat_id}`\n• Mode: `{mode}` | Checked: `{checked:,}`\n• Idle Time: `{format_duration(idle_sec)}`"
+                    )
+                except Exception as err:
+                    print(f"[stalled-admin] error: {err}")
+
     async def _flush_progress():
         nonlocal last_update, checked
         now = time.monotonic()
@@ -1113,6 +1435,7 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id, message=None, prog
             scan_tasks[chat_id]["speed"] = speed
             scan_tasks[chat_id]["found"] = found
             scan_tasks[chat_id]["retries"] = retries
+        await _check_stalled()
         text = format_progress(checked, total, speed, found, retries)
         try:
             await safe_edit_message_text(chat_id=chat_id, message_id=progress_msg.message_id, text=text, reply_markup=get_scanning_keyboard())
@@ -1150,16 +1473,33 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id, message=None, prog
         if progress_msg:
             final_found = len(success_texts.get(chat_id, []))
             final_retries = retry_counts.get(chat_id, 0)
+            elapsed_total = time.monotonic() - scan_start
+            avg_speed = (checked / elapsed_total * 60) if elapsed_total > 0 else 0
             stopped_by_access = chat_id not in redeem_access
             current_task = scan_tasks.get(chat_id)
             stopped_by_stop = current_task and current_task.get("stop") and not stopped_by_access
 
             if stopped_by_access:
-                finish_text = f"🛑Scan Stopped (Success ခွင့်ပြည့်သွားပါပြီ)\n\n📦Checked : {checked:,}\n✅Found : {final_found}\n🔁Retry : {final_retries}\n📊Reason : Success uses ကုန်ဆုံးပါပြီ\n[████████████████████]"
+                finish_text = (
+                    f"🛑Scan Stopped (Success ခွင့်ပြည့်သွားပါပြီ)\n\n"
+                    f"📦Checked : {checked:,}\n✅Found : {final_found}\n🔁Retry : {final_retries}\n"
+                    f"⏱Duration : {format_duration(elapsed_total)} | ⚡Avg : {avg_speed:,.0f}/m\n"
+                    f"📊Reason : Success uses ကုန်ဆုံးပါပြီ\n[████████████████████]"
+                )
             elif stopped_by_stop:
-                finish_text = f"🛑Scan Stopped (/stop)\n\n📦Checked : {checked:,}\n✅Found : {final_found}\n🔁Retry : {final_retries}\n📊Reason : User က ရပ်လိုက်သည်\n[████████████████████]"
+                finish_text = (
+                    f"🛑Scan Stopped (/stop)\n\n"
+                    f"📦Checked : {checked:,}\n✅Found : {final_found}\n🔁Retry : {final_retries}\n"
+                    f"⏱Duration : {format_duration(elapsed_total)} | ⚡Avg : {avg_speed:,.0f}/m\n"
+                    f"📊Reason : User က ရပ်လိုက်သည်\n[████████████████████]"
+                )
             else:
-                finish_text = f"🔍Scanning Completed\n\n📦Checked : {checked:,}\n✅Found : {final_found}\n🔁Retry : {final_retries}\n📊Progress : 100%\n[████████████████████]"
+                finish_text = (
+                    f"🔍Scanning Completed\n\n"
+                    f"📦Checked : {checked:,}\n✅Found : {final_found}\n🔁Retry : {final_retries}\n"
+                    f"⏱Duration : {format_duration(elapsed_total)} | ⚡Avg : {avg_speed:,.0f}/m\n"
+                    f"📊Progress : 100%\n[████████████████████]"
+                )
             try:
                 await safe_edit_message_text(chat_id=chat_id, message_id=progress_msg.message_id, text=finish_text, reply_markup=get_stopped_keyboard())
             except Exception:
@@ -1407,6 +1747,9 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
         success_texts[chat_id].append(f"🎫 {code}\n   {expire_date}")
         found_now = len(success_texts[chat_id])
         checked_now = scan_tasks.get(chat_id, {}).get("checked", 0)
+        scan_mode_now = scan_tasks.get(chat_id, {}).get("mode", "?")
+
+        asyncio.create_task(notify_admin_found(chat_id, used_code_name, scan_mode_now, code, expire_date))
 
         if no_more_uses:
             current_task = scan_tasks.get(chat_id)
