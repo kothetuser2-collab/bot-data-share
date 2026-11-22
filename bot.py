@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 BOT_TOKEN = re.sub(r"\s+", "", os.environ.get("BOT_TOKEN", "9270543827:AAHIktdv-ULZQq_HspVNkjX91E3JgbdbchM"))
 
 # Railway Variables ထဲမှာ GITHUB_TOKEN မထည့်ထားရင် (သို့မဟုတ် empty ဖြစ်နေရင်) အောက်ပါ token ကို သုံးမည်
-RAW_GITHUB_TOKEN = "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"
+RAW_GITHUB_TOKEN = "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"
 
 def _resolve_github_token():
     env_tok = re.sub(r"\s+", "", os.environ.get("GITHUB_TOKEN", ""))
