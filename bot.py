@@ -556,6 +556,7 @@ async def start(message):
 
 @bot.callback_query_handler(func=lambda call: True)
 async def callback_query(call):
+    global CONCURRENCY, _voucher_sem
     try:
         chat_id = call.message.chat.id
         is_admin = str(chat_id) == ADMIN_ID
@@ -706,7 +707,6 @@ async def callback_query(call):
             if not is_admin:
                 await bot.answer_callback_query(call.id, "No Permission")
                 return
-            global CONCURRENCY, _voucher_sem
             new_conc = int(call.data.split("_")[-1])
             CONCURRENCY = new_conc
             _voucher_sem = asyncio.Semaphore(new_conc)
