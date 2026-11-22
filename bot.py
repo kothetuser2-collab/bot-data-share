@@ -763,7 +763,7 @@ async def callback_query(call):
 
         elif call.data == "cmd_status":
             pending_actions.pop(chat_id, None)
-            await bot.answer_callback_query(call.id, "အခြေအနေစစ်ဆေးနေပါပြီ...")
+            await bot.answer_callback_query(call.id, "Health Check စစ်ဆေးနေပါပြီ...")
             await send_bot_status(chat_id, call.message)
 
         elif call.data == "cmd_stats":
@@ -1126,9 +1126,36 @@ async def send_bot_status(chat_id, ref_message=None):
     if str(chat_id) != ADMIN_ID:
         await safe_send_message(chat_id, "No Permission")
         return
+
     active_scans = sum(1 for data in scan_tasks.values() if not data["task"].done())
     approved_users = sum(1 for cid in redeem_access if redeem_access[cid].get("uses_remaining", 0) > 0)
     uptime_seconds = time.monotonic() - _start_time
+
+    # Asyncio task health
+    try:
+        all_tasks = asyncio.all_tasks()
+        active_tasks_count = sum(1 for t in all_tasks if not t.done())
+    except Exception:
+        active_tasks_count = 0
+
+    # Session pool slot usage
+    used_slots = 0
+    total_slots = 0
+    total_slot_uses = 0
+    for pool in _session_pool.values():
+        slots = pool.get("slots", []) if isinstance(pool, dict) else []
+        total_slots += len(slots)
+        for s in slots:
+            if s.get("session_id"):
+                used_slots += 1
+            total_slot_uses += int(s.get("uses", 0))
+
+    # Local memory / dict items
+    codes_count = len(_local_codes)
+    access_count = len(redeem_access)
+    urls_count = len(user_data)
+    pending_count = len(pending_actions)
+
     await safe_send_message(
         chat_id,
         f"📊 Bot Status\n\n"
@@ -1136,8 +1163,12 @@ async def send_bot_status(chat_id, ref_message=None):
         f"⚡ Concurrency: {CONCURRENCY}\n"
         f"🔍 Active Scans: {active_scans}\n"
         f"✅ Approved Users: {approved_users}\n"
-        f"👥 Sessions Loaded: {len(user_data)}\n"
-        f"🔑 Keys in Memory: {len(_local_codes)}"
+        f"👥 Sessions Loaded: {urls_count}\n"
+        f"🔑 Keys in Memory: {codes_count}\n\n"
+        f"🩺 Health Check\n"
+        f"• 🧵 Asyncio Tasks: {active_tasks_count}\n"
+        f"• 🎱 Session Pool Slots: {used_slots}/{total_slots} (uses: {total_slot_uses}, chats: {len(_session_pool)})\n"
+        f"• 🧠 Memory Items: access={access_count}, pending={pending_count}"
     )
 
 @bot.message_handler(commands=['status'])
