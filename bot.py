@@ -18,6 +18,13 @@ RANDOM_CODE_DEFAULT_USES = 5
 GITHUB_SYNC_DEBOUNCE = 5
 STALLED_SCAN_SECONDS = 90
 
+BLOCKED_EXACT_KEYS = {
+    "123456", "1234567", "12345678", "111111", "000000", "222222", "333333",
+    "444444", "555555", "666666", "777777", "888888", "999999", "654321",
+    "ABCDEF", "ABC123", "ABC345", "QWERTY", "ASDFGH", "ZXCVBN", "PASSWORD",
+    "ADMIN1", "ADMIN2", "TEST12", "TEST123", "FREE12", "FREE123"
+}
+
 bot = AsyncTeleBot(BOT_TOKEN)
 _telegram_send = bot.send_message
 _telegram_reply = bot.reply_to
@@ -57,6 +64,47 @@ def format_duration(seconds_val):
     if m > 0:
         return f"{m}m {s}s"
     return f"{s}s"
+
+def is_weak_or_blocked_key(code: str) -> bool:
+    c = (code or "").strip().upper()
+    if not c:
+        return True
+    if c.startswith("ABC"):
+        return True
+    if c in BLOCKED_EXACT_KEYS:
+        return True
+    if len(set(c)) == 1:
+        return True
+    if c.isdigit():
+        asc = "".join(str((int(c[0]) + i) % 10) for i in range(len(c)))
+        desc = "".join(str((int(c[0]) - i) % 10) for i in range(len(c)))
+        if c == asc or c == desc:
+            return True
+    if c.isalpha():
+        seq_up = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        seq_dn = "ZYXWVUTSRQPONMLKJIHGFEDCBA"
+        if c in seq_up or c in seq_dn:
+            return True
+    return False
+
+async def purge_unauthorized_access():
+    async with redeem_lock:
+        codes, _ = await get_file_content("redeem_codes.json")
+        valid_codes = set(codes.keys()) if isinstance(codes, dict) else set()
+        bad_uids = []
+        for uid, acc in redeem_access.items():
+            k = str((acc or {}).get("code", "")).upper()
+            if k not in valid_codes or is_weak_or_blocked_key(k):
+                bad_uids.append(uid)
+        for uid in bad_uids:
+            redeem_access.pop(uid, None)
+            task_info = scan_tasks.get(uid)
+            if task_info and task_info.get("task") and not task_info["task"].done():
+                task_info["stop"] = True
+                task_info["scan_id"] = None
+                for child_task in task_info.get("pending", set()):
+                    child_task.cancel()
+                task_info["task"].cancel()
 
 # =====================================================================
 # MENU KEYBOARDS
@@ -414,7 +462,6 @@ async def add_key_uses(chat_id, raw_input):
         return
 
     updated_github = False
-    updated_mem = False
     new_rem = 0
     new_tot = 0
 
@@ -429,25 +476,16 @@ async def add_key_uses(chat_id, raw_input):
             await update_file_content("redeem_codes.json", codes, sha, f"Add {add_amount} uses to {code}")
             updated_github = True
 
-        if code in random_codes:
-            r_entry = random_codes[code]
-            r_entry["uses_remaining"] = int(r_entry.get("uses_remaining", 0)) + add_amount
-            r_entry["uses_total"] = max(int(r_entry.get("uses_total", r_entry["uses_remaining"])), r_entry["uses_remaining"])
-            if not updated_github:
-                new_rem = r_entry["uses_remaining"]
-                new_tot = r_entry["uses_total"]
-            updated_mem = True
-
         for uid, acc in redeem_access.items():
             if str(acc.get("code", "")).upper() == code:
                 acc["uses_remaining"] = int(acc.get("uses_remaining", 0)) + add_amount
                 acc["uses_total"] = max(int(acc.get("uses_total", acc["uses_remaining"])), acc["uses_remaining"])
-                if not updated_github and not updated_mem:
+                if not updated_github:
                     new_rem = acc["uses_remaining"]
                     new_tot = acc["uses_total"]
 
-    if not updated_github and not updated_mem:
-        await safe_send_message(chat_id, f"⚠️ `{code}` ကို မတွေ့ပါ။", parse_mode="Markdown")
+    if not updated_github:
+        await safe_send_message(chat_id, f"⚠️ `{code}` ကို `redeem_codes.json` ထဲတွင် မတွေ့ပါ။", parse_mode="Markdown")
         return
 
     await safe_send_message(
@@ -480,13 +518,6 @@ async def reset_key_usage(chat_id, raw_code):
             await update_file_content("redeem_codes.json", codes, sha, f"Reset key {code}")
             found_any = True
 
-        if code in random_codes:
-            tot = max(1, int(random_codes[code].get("uses_total", RANDOM_CODE_DEFAULT_USES)))
-            random_codes[code]["uses_remaining"] = tot
-            random_codes[code]["claimed_by"] = None
-            reset_tot = tot
-            found_any = True
-
         users_to_drop = [
             uid for uid, acc in redeem_access.items()
             if str(acc.get("code", "")).upper() == code
@@ -495,7 +526,7 @@ async def reset_key_usage(chat_id, raw_code):
             redeem_access.pop(uid, None)
 
     if not found_any:
-        await safe_send_message(chat_id, f"⚠️ `{code}` ကို မတွေ့ပါ။", parse_mode="Markdown")
+        await safe_send_message(chat_id, f"⚠️ `{code}` ကို `redeem_codes.json` ထဲတွင် မတွေ့ပါ။", parse_mode="Markdown")
         return
 
     await safe_send_message(
@@ -522,7 +553,6 @@ async def clean_exhausted_keys(chat_id):
 
         for k in exhausted:
             codes.pop(k, None)
-            random_codes.pop(k, None)
 
         await update_file_content(
             "redeem_codes.json",
@@ -543,6 +573,7 @@ async def clean_exhausted_keys(chat_id):
 @bot.message_handler(commands=['start'])
 async def start(message):
     pending_actions.pop(message.chat.id, None)
+    await purge_unauthorized_access()
     is_admin = str(message.chat.id) == ADMIN_ID
     text = (
         "🤖 Bot မှ ကြိုဆိုပါတယ်\n"
@@ -563,6 +594,7 @@ async def callback_query(call):
 
         if call.data == "cmd_start":
             pending_actions.pop(chat_id, None)
+            await purge_unauthorized_access()
             text = "🤖 အောက်ပါ ခလုတ်များမှ လုပ်ဆောင်လိုသည်ကို ရွေးချယ်ပါ —"
             try:
                 await bot.edit_message_text(text, chat_id, call.message.message_id, reply_markup=get_main_keyboard(is_admin))
@@ -572,6 +604,7 @@ async def callback_query(call):
 
         elif call.data == "cmd_my_status":
             pending_actions.pop(chat_id, None)
+            await purge_unauthorized_access()
             await bot.answer_callback_query(call.id, "အခြေအနေ ကြည့်နေပါပြီ...")
             await send_user_status(chat_id)
 
@@ -580,7 +613,7 @@ async def callback_query(call):
             await bot.answer_callback_query(call.id, "Key ရိုက်ထည့်ပေးပါ")
             await bot.send_message(
                 chat_id,
-                "🔑 အဆင့် (၁) - Key ထည့်ရန်\nKey ကို ရိုးရိုးရိုက်ပို့ပေးပါ (ဥပမာ - IH39KM)။\nပြီးလျှင် 🌐 URL ထည့်ရန် ခလုတ် ဆက်နှိပ်နိုင်ပါသည်။"
+                "🔑 အဆင့် (၁) - Key ထည့်ရန်\nAdmin ထုတ်ပေးထားသော ၆ လုံး Key ကို ရိုးရိုးရိုက်ပို့ပေးပါ။\nပြီးလျှင် 🌐 URL ထည့်ရန် ခလုတ် ဆက်နှိပ်နိုင်ပါသည်။"
             )
 
         elif call.data == "cmd_input_help":
@@ -604,7 +637,7 @@ async def callback_query(call):
             mode = call.data.split("_", 1)[1]
             if not await redeem_user_access(chat_id):
                 await bot.answer_callback_query(call.id, "Key အရင်ထည့်ပါ")
-                await bot.send_message(chat_id, "❌ အရင်ဆုံး 🔑 Key ထည့်ရန် နှိပ်ပြီး Key ထည့်ပေးပါ။", reply_markup=get_main_keyboard(is_admin))
+                await bot.send_message(chat_id, "❌ အရင်ဆုံး 🔑 Key ထည့်ရန် နှိပ်ပြီး Valid Key ထည့်ပေးပါ။", reply_markup=get_main_keyboard(is_admin))
                 return
             if chat_id not in user_data or 'session_url' not in user_data[chat_id]:
                 await bot.answer_callback_query(call.id, "URL အရင်ထည့်ပါ")
@@ -739,22 +772,20 @@ async def callback_query(call):
 
         elif call.data == "cmd_stats":
             pending_actions.pop(chat_id, None)
+            await purge_unauthorized_access()
             await bot.answer_callback_query(call.id, "ကျန်ရှိမှု စစ်ဆေးနေပါပြီ...")
             await send_remaining_stats(chat_id, call.message)
 
     except Exception as e:
         print(f"Callback Error: {e}")
 
-def is_blocked_key(code: str) -> bool:
-    return (code or "").upper().startswith("ABC")
-
 def generate_redeem_code(existing_codes):
     alphabet = string.ascii_uppercase + string.digits
     while True:
         code = ''.join(random.choice(alphabet) for _ in range(6))
-        if is_blocked_key(code):
+        if is_weak_or_blocked_key(code):
             continue
-        if code not in existing_codes and code not in random_codes:
+        if code not in existing_codes:
             return code
 
 async def delete_redeem_code(chat_id, raw_code):
@@ -767,16 +798,11 @@ async def delete_redeem_code(chat_id, raw_code):
         await safe_send_message(chat_id, "❌ မှန်ကန်တဲ့ ၆ လုံး Key ရိုက်ထည့်ပေးပါ (ဥပမာ - IH39KM)။")
         return
 
-    removed_mem = False
     revoked_users = 0
     stopped_scans = 0
     deleted_github = False
 
     async with redeem_lock:
-        if code in random_codes:
-            random_codes.pop(code, None)
-            removed_mem = True
-
         target_users = [
             uid for uid, acc in redeem_access.items()
             if isinstance(acc, dict) and str(acc.get("code", "")).upper() == code
@@ -805,7 +831,7 @@ async def delete_redeem_code(chat_id, raw_code):
             )
             deleted_github = True
 
-    if not deleted_github and not removed_mem and revoked_users == 0:
+    if not deleted_github and revoked_users == 0:
         await safe_send_message(chat_id, f"⚠️ `{code}` ကို မတွေ့ပါ။", parse_mode="Markdown")
         return
 
@@ -823,7 +849,7 @@ async def redeem_user_access(chat_id):
         access = redeem_access.get(chat_id)
         if not access or access.get("uses_remaining", 0) <= 0:
             return False
-        if is_blocked_key(access.get("code", "")):
+        if is_weak_or_blocked_key(access.get("code", "")):
             redeem_access.pop(chat_id, None)
             return False
         return True
@@ -833,7 +859,7 @@ async def consume_redeem_use(chat_id):
         access = redeem_access.get(chat_id)
         if not access or access.get("uses_remaining", 0) <= 0:
             return False
-        if is_blocked_key(access.get("code", "")):
+        if is_weak_or_blocked_key(access.get("code", "")):
             redeem_access.pop(chat_id, None)
             return False
         return True
@@ -842,79 +868,34 @@ async def process_redeem_code(message, raw_code):
     chat_id = message.chat.id
     is_admin = str(chat_id) == ADMIN_ID
     if not re.fullmatch(r"[A-Z0-9]{6}", raw_code.upper()):
-        await bot.reply_to(message, "Usage: /redeem ABC123")
+        await bot.reply_to(message, "Usage: /redeem <6-char-key>")
         return
     code = raw_code.upper()
-    if is_blocked_key(code):
-        await bot.reply_to(message, "❌ `ABC` ဖြင့် စသော Key များကို အသုံးပြုခွင့် ပိတ်ထားပါသည်။", parse_mode="Markdown")
+    if is_weak_or_blocked_key(code):
+        await bot.reply_to(message, "❌ ခန့်မှန်းလွယ်သော / ပိတ်ပင်ထားသော Key များကို လက်မခံပါ။ Admin ထုတ်ပေးထားသော Key ကိုသာ အသုံးပြုပါ။")
         return
     str_chat_id = str(chat_id)
 
-    if chat_id in redeem_access and redeem_access[chat_id].get("code") == code:
-        access = redeem_access[chat_id]
-        await bot.reply_to(
-            message,
-            f"ဒီ code ကို သင်အသုံးပြုပြီးသားပါ။ ကျန်ရှိမှု: {access['uses_remaining']}\n\nဆက်သွားရန် ခလုတ်ရွေးပါ —",
-            reply_markup=get_after_redeem_keyboard(is_admin)
-        )
-        return
-
     async with redeem_lock:
-        rand_entry = random_codes.get(code)
-        if rand_entry is not None:
-            claimed_by = rand_entry.get("claimed_by")
-            if claimed_by and claimed_by != str_chat_id:
-                await bot.reply_to(message, "ဒီ redeem code ကို အခြား user က အသုံးပြုပြီးပါပြီ။")
-                return
-            remaining = rand_entry["uses_remaining"]
-            if remaining <= 0:
-                await bot.reply_to(message, "ဒီ redeem code ရဲ့ access time ကုန်ဆုံးပါပြီ။")
-                return
-            rand_entry["claimed_by"] = str_chat_id
-            redeem_access[chat_id] = {
-                "code": code,
-                "uses_remaining": remaining,
-                "uses_total": rand_entry["uses_total"],
-            }
-            await bot.reply_to(
-                message,
-                f"Redeem အောင်မြင်ပါသည်။\nSuccess ရှာဖွေခွင့် ကျန်ရှိမှု: {remaining}\n\nနောက်တစ်ဆင့် ခလုတ်ရွေးပါ —",
-                reply_markup=get_after_redeem_keyboard(is_admin)
-            )
-            return
-
         codes, sha = await get_file_content("redeem_codes.json")
-        entry = codes.get(code)
+        entry = codes.get(code) if isinstance(codes, dict) else None
 
         if not entry:
-            random_codes[code] = {
-                "uses_total": RANDOM_CODE_DEFAULT_USES,
-                "uses_remaining": RANDOM_CODE_DEFAULT_USES,
-                "claimed_by": str_chat_id,
-            }
-            redeem_access[chat_id] = {
-                "code": code,
-                "uses_remaining": RANDOM_CODE_DEFAULT_USES,
-                "uses_total": RANDOM_CODE_DEFAULT_USES,
-            }
-            print(f"[redeem] random code {code} accepted for {str_chat_id}")
-            await bot.reply_to(
-                message,
-                f"Redeem အောင်မြင်ပါသည် (ကျပန်း code)။\nSuccess ရှာဖွေခွင့် ကျန်ရှိမှု: {RANDOM_CODE_DEFAULT_USES}\n\nနောက်တစ်ဆင့် ခလုတ်ရွေးပါ —",
-                reply_markup=get_after_redeem_keyboard(is_admin)
-            )
+            await bot.reply_to(message, "❌ မှန်ကန်သော Key မဟုတ်ပါ (သို့မဟုတ် Admin ထုတ်ပေးထားသော Key မဟုတ်ပါ)။")
             return
 
         claimed_by = entry.get("claimed_by")
         if claimed_by and claimed_by != str_chat_id:
-            await bot.reply_to(message, "ဒီ redeem code ကို အခြား user က အသုံးပြုပြီးပါပြီ။")
+            await bot.reply_to(message, "❌ ဒီ redeem code ကို အခြား user က အသုံးပြုပြီးပါပြီ။")
             return
         remaining = int(entry.get("uses_remaining", 0))
         if remaining <= 0:
-            await bot.reply_to(message, "ဒီ redeem code ရဲ့ access time ကုန်ဆုံးပါပြီ။")
+            await bot.reply_to(message, "❌ ဒီ redeem code ရဲ့ access time ကုန်ဆုံးပါပြီ။")
             return
+
         entry["claimed_by"] = str_chat_id
-        entry["claimed_at"] = datetime.now(timezone.utc).isoformat()
+        if not entry.get("claimed_at"):
+            entry["claimed_at"] = datetime.now(timezone.utc).isoformat()
         await update_file_content("redeem_codes.json", codes, sha, f"Redeem code {code} by {str_chat_id}")
         redeem_access[chat_id] = {
             "code": code,
@@ -943,6 +924,8 @@ async def process_genredeem_args(message, arg_text):
         return
     async with redeem_lock:
         codes, sha = await get_file_content("redeem_codes.json")
+        if not isinstance(codes, dict):
+            codes = {}
         generated = []
         for _ in range(count):
             code = generate_redeem_code(codes)
@@ -966,7 +949,7 @@ async def redeem(message):
     pending_actions.pop(message.chat.id, None)
     args = message.text.split()
     if len(args) != 2:
-        await bot.reply_to(message, "Usage: /redeem ABC123")
+        await bot.reply_to(message, "Usage: /redeem <6-char-key>")
         return
     await process_redeem_code(message, args[1])
 
@@ -987,16 +970,12 @@ async def send_redeem_list(chat_id, ref_message=None):
         await safe_send_message(chat_id, "No Permission")
         return
     codes, _ = await get_file_content("redeem_codes.json")
-    if not codes and not random_codes:
+    if not codes:
         await safe_send_message(chat_id, "Redeem code မရှိသေးပါ။")
         return
     lines = []
     for code, entry in codes.items():
         lines.append(f"`{code}` | {entry.get('uses_remaining', 0)}/{entry.get('uses_total', 0)} | user: {entry.get('claimed_by') or '-'}")
-    if random_codes:
-        lines.append("\n--- Random Codes (memory) ---")
-        for code, entry in random_codes.items():
-            lines.append(f"`{code}` | {entry.get('uses_remaining', 0)}/{entry.get('uses_total', 0)} | user: {entry.get('claimed_by') or '-'}")
     for chunk in split_telegram_message("Redeem codes:\n" + "\n".join(lines)):
         await safe_send_message(chat_id, chunk, parse_mode="Markdown")
 
@@ -1041,7 +1020,7 @@ async def check_session_url(session_url):
 async def process_input_url(message, url):
     chat_id = message.chat.id
     if not await redeem_user_access(chat_id):
-        await bot.reply_to(message, "/input မလုပ်မီ /redeem <code> ကိုအရင်လုပ်ပေးပါ။")
+        await bot.reply_to(message, "/input မလုပ်မီ Valid Key ကိုအရင် Redeem လုပ်ပေးပါ။")
         return
     url = url.strip()
     if is_unsupported_signed_url(url):
@@ -1095,7 +1074,7 @@ async def start_scan_job(mode, chat_id, message, prefix=""):
         await bot.reply_to(message, "Mode သည် 6, 7, 8, all, ascii-lower ထဲမှ တစ်ခုဖြစ်ရပါမည်။")
         return
     if not await redeem_user_access(chat_id):
-        await bot.reply_to(message, "/scan မလုပ်မီ Key အရင်ထည့်ပေးပါ။", reply_markup=get_main_keyboard(is_admin))
+        await bot.reply_to(message, "/scan မလုပ်မီ Valid Key အရင်ထည့်ပေးပါ။", reply_markup=get_main_keyboard(is_admin))
         return
     if chat_id not in user_data or 'session_url' not in user_data[chat_id]:
         await bot.reply_to(message, "/scan မလုပ်မီ Session URL အရင်ထည့်ပေးပါ။", reply_markup=get_after_redeem_keyboard(is_admin))
@@ -1161,8 +1140,7 @@ async def send_bot_status(chat_id, ref_message=None):
         f"⚡ Concurrency: {CONCURRENCY}\n"
         f"🔍 Active Scans: {active_scans}\n"
         f"✅ Approved Users: {approved_users}\n"
-        f"👥 Sessions Loaded: {len(user_data)}\n"
-        f"🎲 Random Codes: {len(random_codes)}"
+        f"👥 Sessions Loaded: {len(user_data)}"
     )
 
 @bot.message_handler(commands=['status'])
@@ -1615,7 +1593,7 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
             return
 
     access = redeem_access.get(chat_id)
-    if not access or access.get("uses_remaining", 0) <= 0 or is_blocked_key(access.get("code", "")):
+    if not access or access.get("uses_remaining", 0) <= 0 or is_weak_or_blocked_key(access.get("code", "")):
         current_task = scan_tasks.get(chat_id)
         if current_task and not current_task["task"].done():
             current_task["stop"] = True
@@ -1917,6 +1895,7 @@ async def start_polling():
 
 async def main():
     await rebuild_session()
+    await purge_unauthorized_access()
     try:
         asyncio.create_task(web_server())
         await start_polling()
