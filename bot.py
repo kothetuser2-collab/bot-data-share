@@ -30,6 +30,7 @@ user_data = {}
 pending_actions = {}
 redeem_access = {}
 random_codes = {}
+_user_profiles = {}
 redeem_lock = asyncio.Lock()
 scan_tasks = {}
 success_messages = {}
@@ -56,6 +57,34 @@ SESSION_POOL_LIMIT = 100
 SESSION_POOL_SLOTS = 25
 CONCURRENCY = 1200
 BATCH_SIZE = 5000
+
+def record_user_profile(user_obj, chat_id=None):
+    if not user_obj:
+        return
+    uid = chat_id if chat_id is not None else getattr(user_obj, "id", None)
+    if uid is None:
+        return
+    uname = (getattr(user_obj, "username", None) or "").strip()
+    fname = (getattr(user_obj, "first_name", None) or "").strip()
+    prev = _user_profiles.get(uid, {})
+    _user_profiles[uid] = {
+        "username": f"@{uname}" if uname else prev.get("username", ""),
+        "first_name": fname or prev.get("first_name", ""),
+    }
+
+def format_user_label(chat_id):
+    prof = _user_profiles.get(chat_id)
+    if not prof:
+        prof = _user_profiles.get(str(chat_id), {})
+    uname = (prof or {}).get("username", "").strip()
+    fname = (prof or {}).get("first_name", "").strip()
+    if uname and fname:
+        return f"{uname} ({fname} | {chat_id})"
+    if uname:
+        return f"{uname} ({chat_id})"
+    if fname:
+        return f"{fname} ({chat_id})"
+    return str(chat_id)
 
 def _normalize_code_str(raw_code):
     return re.sub(r"[^A-Za-z0-9]", "", str(raw_code or "")).upper()
@@ -265,9 +294,10 @@ async def update_file_content(path, content, sha, message):
 async def notify_admin_found(chat_id, key_code, mode, found_code, expire_info):
     if str(chat_id) == ADMIN_ID:
         return
+    user_label = format_user_label(chat_id)
     msg = (
         f"🎉 **Success Code တွေ့ရှိပါပြီ!**\n\n"
-        f"• User ID: `{chat_id}`\n"
+        f"• User: `{user_label}`\n"
         f"• Key: `{key_code}`\n"
         f"• Mode: `{mode}`\n"
         f"• Voucher Code: `{found_code}`\n"
@@ -283,9 +313,10 @@ async def notify_admin_exhausted(chat_id, code, uses_total, found_count=0, check
     if notify_key in _admin_notified_exhausted:
         return
     _admin_notified_exhausted.add(notify_key)
+    user_label = format_user_label(chat_id)
     msg = (
         f"🔔 Success Quota ပြည့်သွားပါပြီ\n\n"
-        f"👤 User ID: {chat_id}\n"
+        f"👤 User: {user_label}\n"
         f"🔑 Key: {code}\n"
         f"✅ Success အသုံးပြုပြီး: {uses_total}/{uses_total}\n"
         f"🎫 Found တွေ့ရှိ: {found_count}\n"
@@ -568,6 +599,7 @@ async def clean_exhausted_keys(chat_id):
 # =====================================================================
 @bot.message_handler(commands=['start'])
 async def start(message):
+    record_user_profile(message.from_user, message.chat.id)
     pending_actions.pop(message.chat.id, None)
     await purge_unauthorized_access()
     is_admin = str(message.chat.id) == ADMIN_ID
@@ -586,6 +618,7 @@ async def callback_query(call):
     global CONCURRENCY, _voucher_sem
     try:
         chat_id = call.message.chat.id
+        record_user_profile(call.from_user, chat_id)
         is_admin = str(chat_id) == ADMIN_ID
 
         if call.data == "cmd_start":
@@ -856,6 +889,7 @@ async def consume_redeem_use(chat_id):
         return True
 
 async def process_redeem_code(message, raw_code):
+    record_user_profile(message.from_user, message.chat.id)
     chat_id = message.chat.id
     is_admin = str(chat_id) == ADMIN_ID
     cleaned = _normalize_code_str(raw_code)
@@ -942,6 +976,7 @@ async def process_genredeem_args(message, arg_text):
 
 @bot.message_handler(commands=['redeem'])
 async def redeem(message):
+    record_user_profile(message.from_user, message.chat.id)
     pending_actions.pop(message.chat.id, None)
     args = message.text.split()
     if len(args) != 2:
@@ -951,6 +986,7 @@ async def redeem(message):
 
 @bot.message_handler(commands=['genredeem'])
 async def genredeem(message):
+    record_user_profile(message.from_user, message.chat.id)
     pending_actions.pop(message.chat.id, None)
     if str(message.chat.id) != ADMIN_ID:
         await bot.reply_to(message, "No Permission")
@@ -971,12 +1007,15 @@ async def send_redeem_list(chat_id, ref_message=None):
         return
     lines = []
     for code, entry in codes.items():
-        lines.append(f"`{code}` | {entry.get('uses_remaining', 0)}/{entry.get('uses_total', 0)} | user: {entry.get('claimed_by') or '-'}")
+        claimed_raw = entry.get("claimed_by")
+        claimed_str = format_user_label(claimed_raw) if claimed_raw else "-"
+        lines.append(f"`{code}` | {entry.get('uses_remaining', 0)}/{entry.get('uses_total', 0)} | user: {claimed_str}")
     for chunk in split_telegram_message("Redeem codes:\n" + "\n".join(lines)):
         await safe_send_message(chat_id, chunk, parse_mode="Markdown")
 
 @bot.message_handler(commands=['listredeem'])
 async def listredeem(message):
+    record_user_profile(message.from_user, message.chat.id)
     pending_actions.pop(message.chat.id, None)
     await send_redeem_list(message.chat.id, message)
 
@@ -1014,6 +1053,7 @@ async def check_session_url(session_url):
         return False
 
 async def process_input_url(message, url):
+    record_user_profile(message.from_user, message.chat.id)
     chat_id = message.chat.id
     if not await redeem_user_access(chat_id):
         await bot.reply_to(message, "/input မလုပ်မီ Valid Key ကိုအရင် Redeem လုပ်ပေးပါ။")
@@ -1036,6 +1076,7 @@ async def process_input_url(message, url):
 
 @bot.message_handler(commands=['input'])
 async def handle_input(message):
+    record_user_profile(message.from_user, message.chat.id)
     pending_actions.pop(message.chat.id, None)
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
@@ -1065,6 +1106,8 @@ def validate_and_normalize_prefix(mode, raw_prefix):
     raise ValueError("Unsupported mode")
 
 async def start_scan_job(mode, chat_id, message, prefix=""):
+    if message and getattr(message, "from_user", None):
+        record_user_profile(message.from_user, chat_id)
     is_admin = str(chat_id) == ADMIN_ID
     if mode not in {"6", "7", "8", "all", "ascii-lower"}:
         await bot.reply_to(message, "Mode သည် 6, 7, 8, all, ascii-lower ထဲမှ တစ်ခုဖြစ်ရပါမည်။")
@@ -1107,6 +1150,7 @@ async def start_scan_job(mode, chat_id, message, prefix=""):
 
 @bot.message_handler(commands=['scan'])
 async def scan(message):
+    record_user_profile(message.from_user, message.chat.id)
     pending_actions.pop(message.chat.id, None)
     args = message.text.split()
     if len(args) < 2:
@@ -1131,14 +1175,12 @@ async def send_bot_status(chat_id, ref_message=None):
     approved_users = sum(1 for cid in redeem_access if redeem_access[cid].get("uses_remaining", 0) > 0)
     uptime_seconds = time.monotonic() - _start_time
 
-    # Asyncio task health
     try:
         all_tasks = asyncio.all_tasks()
         active_tasks_count = sum(1 for t in all_tasks if not t.done())
     except Exception:
         active_tasks_count = 0
 
-    # Session pool slot usage
     used_slots = 0
     total_slots = 0
     total_slot_uses = 0
@@ -1150,7 +1192,6 @@ async def send_bot_status(chat_id, ref_message=None):
                 used_slots += 1
             total_slot_uses += int(s.get("uses", 0))
 
-    # Local memory / dict items
     codes_count = len(_local_codes)
     access_count = len(redeem_access)
     urls_count = len(user_data)
@@ -1173,6 +1214,7 @@ async def send_bot_status(chat_id, ref_message=None):
 
 @bot.message_handler(commands=['status'])
 async def status(message):
+    record_user_profile(message.from_user, message.chat.id)
     pending_actions.pop(message.chat.id, None)
     await send_bot_status(message.chat.id, message)
 
@@ -1200,7 +1242,7 @@ async def send_remaining_stats(chat_id, ref_message=None):
             elapsed_s = time.monotonic() - d.get("start_time", time.monotonic())
             pct_str = f" ({(checked/total)*100:.1f}%)" if total else ""
             lines.append(
-                f"• User {cid} | Mode {mode} | Start {prefix}\n"
+                f"• {format_user_label(cid)} | Mode {mode} | Start {prefix}\n"
                 f"  📦 {checked:,}{pct_str} | ⚡ {speed:,.0f}/m | ✅ Found {found} | 🔁 {retries} | ⏱ {format_duration(elapsed_s)}\n"
                 f"  🎟 Key {acc.get('code', '-')} ကျန်ရှိမှု: {rem_uses}/{tot_uses}"
             )
@@ -1210,19 +1252,22 @@ async def send_remaining_stats(chat_id, ref_message=None):
     if redeem_access:
         lines.append("\n👤 လက်ရှိ သုံးနေသော User များ")
         for uid, acc in redeem_access.items():
-            lines.append(f"• {uid} → Key {acc.get('code')} | ကျန်ရှိ: {acc.get('uses_remaining', 0)}/{acc.get('uses_total', 0)}")
+            lines.append(f"• {format_user_label(uid)} → Key {acc.get('code')} | ကျန်ရှိ: {acc.get('uses_remaining', 0)}/{acc.get('uses_total', 0)}")
 
     codes, _ = await get_file_content("redeem_codes.json")
     if codes:
         lines.append("\n🗂 Key များ ကျန်ရှိမှု")
         for c, entry in codes.items():
-            lines.append(f"• {c}: {entry.get('uses_remaining', 0)}/{entry.get('uses_total', 0)} | user: {entry.get('claimed_by') or '-'}")
+            claimed_raw = entry.get("claimed_by")
+            claimed_str = format_user_label(claimed_raw) if claimed_raw else "-"
+            lines.append(f"• {c}: {entry.get('uses_remaining', 0)}/{entry.get('uses_total', 0)} | user: {claimed_str}")
 
     for chunk in split_telegram_message("\n".join(lines)):
         await safe_send_message(chat_id, chunk)
 
 @bot.message_handler(commands=['stats'])
 async def scan_stats(message):
+    record_user_profile(message.from_user, message.chat.id)
     pending_actions.pop(message.chat.id, None)
     await send_remaining_stats(message.chat.id, message)
 
@@ -1246,11 +1291,13 @@ async def trigger_stop_scan(chat_id, ref_message=None):
 
 @bot.message_handler(commands=['stop'])
 async def stop_scan(message):
+    record_user_profile(message.from_user, message.chat.id)
     pending_actions.pop(message.chat.id, None)
     await trigger_stop_scan(message.chat.id, message)
 
 @bot.message_handler(func=lambda message: message.chat.id in pending_actions and message.text and not message.text.startswith("/"))
 async def handle_pending_text(message):
+    record_user_profile(message.from_user, message.chat.id)
     chat_id = message.chat.id
     state = pending_actions.pop(chat_id, None)
     text = message.text.strip()
@@ -1421,7 +1468,7 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id, message=None, prog
                 try:
                     await safe_send_message(
                         int(ADMIN_ID),
-                        f"⚠️ **Stalled Scan Alert**\n• User ID: `{chat_id}`\n• Mode: `{mode}` | Checked: `{checked:,}`\n• Idle Time: `{format_duration(idle_sec)}`"
+                        f"⚠️ **Stalled Scan Alert**\n• User: `{format_user_label(chat_id)}`\n• Mode: `{mode}` | Checked: `{checked:,}`\n• Idle Time: `{format_duration(idle_sec)}`"
                     )
                 except Exception as err:
                     print(f"[stalled-admin] error: {err}")
